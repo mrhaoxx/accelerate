@@ -65,7 +65,26 @@ from .dataclasses import (
     TorchDynamoPlugin,
     TorchTensorParallelConfig,
     TorchTensorParallelPlugin,
+    KTransformersPlugin,
     add_model_config_to_megatron_parser,
+)
+from .kt_moe import (
+    KT_KERNEL_AVAILABLE,
+    build_kt_device_map,
+    build_kt_device_map_simplified,
+    get_kt_loading_kwargs,
+    move_non_experts_to_gpu,
+    get_expert_device,
+    update_kt_lora_pointers,
+    get_kt_lora_params,
+    sync_kt_lora_gradients,
+    load_kt_model,
+    load_moe_lora_from_adapter,
+    load_kt_moe_from_adapter,
+    load_lora_experts_from_adapter,
+    save_moe_lora_to_adapter,
+    save_lora_experts_to_adapter,
+    save_kt_moe_to_adapter,
 )
 from .environment import (
     are_libraries_initialized,

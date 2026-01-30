@@ -2767,6 +2767,162 @@ def parse_llama_config(megatron_lm_plugin, model, batch_data):
 
 
 @dataclass
+class KTransformersPlugin:
+    """
+    Plugin to enable KTransformers MoE wrapping inside Accelerate.
+
+    Args:
+        enabled (`bool`, defaults to env ACCELERATE_USE_KT or False):
+            Whether to enable KT wrapping.
+        kt_backend (`str`, defaults to "AMXBF16"):
+            KT backend type (e.g., AMXBF16, AMXINT8, AMXINT4, and *_SkipLoRA variants).
+        kt_num_gpu_experts (`int`, defaults to 0):
+            Number of routed experts to keep on GPU in the device_map helper.
+        kt_num_threads (`int`, defaults to 1):
+            Number of CPU threads for KT inference.
+        kt_tp_enabled (`bool`, defaults to False):
+            Whether KT TP mode is enabled.
+        kt_threadpool_count (`int`, defaults to 1):
+            Threadpool count when kt_tp_enabled is True.
+        kt_max_cache_depth (`int`, defaults to 1):
+            KT wrapper cache depth.
+        kt_weight_path (`str`, defaults to None):
+            Path to preprocessed INT8 weights.
+        kt_use_lora_experts (`bool`, defaults to False):
+            Whether to enable LoRA Experts mode.
+        kt_lora_expert_num (`int`, defaults to None):
+            Number of LoRA Experts when kt_use_lora_experts is True.
+        kt_lora_expert_intermediate_size (`int`, defaults to None):
+            Intermediate size for LoRA Experts.
+        lora_rank (`int`, defaults to None):
+            LoRA rank for KT MoE layers.
+        lora_alpha (`float`, defaults to None):
+            LoRA alpha for KT MoE layers.
+        model_max_length (`int`, defaults to None):
+            Model max length for KT chunked prefill size.
+        kt_skip_expert_loading (`bool`, defaults to None):
+            Skip loading MoE expert weights into the HF model when KT is enabled.
+        kt_checkpoint_files (`list[str]`, defaults to None):
+            Resolved checkpoint files used for on-the-fly expert weight loading.
+        kt_sharded_metadata (`dict`, defaults to None):
+            Shard metadata (weight map) for checkpoint files.
+        bypass_device_map_check (`bool`, defaults to True):
+            Skip Accelerate's device_map validation.
+        skip_device_placement (`bool`, defaults to True):
+            Force device_placement=False for models wrapped by KT.
+        allowed_distributed_types (`tuple[DistributedType, ...]`, defaults to (DistributedType.NO,)):
+            Allowed distributed types when KT is enabled.
+        require_single_process (`bool`, defaults to True):
+            Require single-process execution.
+        wrap_fn (`Callable`, defaults to None):
+            Optional override for the KT wrapping function.
+        wrap_kwargs (`dict`, defaults to None):
+            Extra kwargs passed to wrap_fn.
+    """
+
+    enabled: bool | None = None
+    kt_backend: str | None = None
+    kt_num_gpu_experts: int | None = None
+    kt_num_threads: int | None = None
+    kt_tp_enabled: bool | None = None
+    kt_threadpool_count: int | None = None
+    kt_max_cache_depth: int | None = None
+    kt_weight_path: str | None = None
+    kt_use_lora_experts: bool | None = None
+    kt_lora_expert_num: int | None = None
+    kt_lora_expert_intermediate_size: int | None = None
+    lora_rank: int | None = None
+    lora_alpha: float | None = None
+    model_max_length: int | None = None
+    kt_skip_expert_loading: bool | None = None
+    kt_checkpoint_files: list[str] | None = None
+    kt_sharded_metadata: dict | None = None
+    bypass_device_map_check: bool | None = None
+    skip_device_placement: bool | None = None
+    allowed_distributed_types: tuple[DistributedType, ...] = (DistributedType.NO, DistributedType.FSDP)
+    require_single_process: bool = False
+    wrap_fn: Callable[..., Any] | None = None
+    wrap_kwargs: dict[str, Any] | None = None
+
+    @staticmethod
+    def _get_env_int(key: str, default: int | None) -> int | None:
+        value = os.environ.get(key, None)
+        if value is None or value == "":
+            return default
+        return int(value)
+
+    @staticmethod
+    def _get_env_float(key: str, default: float | None) -> float | None:
+        value = os.environ.get(key, None)
+        if value is None or value == "":
+            return default
+        return float(value)
+
+    def __post_init__(self):
+        if self.enabled is None:
+            self.enabled = parse_flag_from_env("ACCELERATE_USE_KT", default=False)
+
+        if self.kt_backend is None:
+            self.kt_backend = os.environ.get("ACCELERATE_KT_BACKEND", "AMXBF16")
+
+        if self.kt_num_gpu_experts is None:
+            self.kt_num_gpu_experts = self._get_env_int("ACCELERATE_KT_NUM_GPU_EXPERTS", 0)
+
+        if self.kt_num_threads is None:
+            self.kt_num_threads = self._get_env_int("ACCELERATE_KT_NUM_THREADS", 1)
+
+        if self.kt_tp_enabled is None:
+            self.kt_tp_enabled = parse_flag_from_env("ACCELERATE_KT_TP_ENABLED", default=False)
+
+        if self.kt_threadpool_count is None:
+            self.kt_threadpool_count = self._get_env_int("ACCELERATE_KT_THREADPOOL_COUNT", 1)
+
+        if self.kt_max_cache_depth is None:
+            self.kt_max_cache_depth = self._get_env_int("ACCELERATE_KT_MAX_CACHE_DEPTH", 8)
+
+        if self.kt_weight_path is None:
+            self.kt_weight_path = os.environ.get("ACCELERATE_KT_WEIGHT_PATH", None)
+
+        if self.kt_use_lora_experts is None:
+            self.kt_use_lora_experts = parse_flag_from_env("ACCELERATE_KT_USE_LORA_EXPERTS", default=False)
+
+        if self.kt_lora_expert_num is None:
+            self.kt_lora_expert_num = self._get_env_int("ACCELERATE_KT_LORA_EXPERT_NUM", None)
+
+        if self.kt_lora_expert_intermediate_size is None:
+            self.kt_lora_expert_intermediate_size = self._get_env_int(
+                "ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE", None
+            )
+
+        if self.lora_rank is None:
+            self.lora_rank = self._get_env_int("ACCELERATE_KT_LORA_RANK", None)
+
+        if self.lora_alpha is None:
+            self.lora_alpha = self._get_env_float("ACCELERATE_KT_LORA_ALPHA", None)
+
+        if self.model_max_length is None:
+            self.model_max_length = self._get_env_int("ACCELERATE_KT_MODEL_MAX_LENGTH", None)
+
+        if self.kt_skip_expert_loading is None and self.enabled:
+            # Default to skipping expert weights when KT is enabled (they will be loaded by KT at wrap time).
+            if "ACCELERATE_KT_SKIP_EXPERT_LOADING" in os.environ:
+                self.kt_skip_expert_loading = parse_flag_from_env(
+                    "ACCELERATE_KT_SKIP_EXPERT_LOADING", default=True
+                )
+            else:
+                self.kt_skip_expert_loading = True
+
+        if self.bypass_device_map_check is None:
+            self.bypass_device_map_check = parse_flag_from_env(
+                "ACCELERATE_KT_BYPASS_DEVICE_MAP", default=True
+            )
+
+        if self.skip_device_placement is None:
+            self.skip_device_placement = parse_flag_from_env(
+                "ACCELERATE_KT_SKIP_DEVICE_PLACEMENT", default=True
+            )
+
+@dataclass
 class BnbQuantizationConfig:
     """
     A plugin to enable BitsAndBytes 4bit and 8bit quantization

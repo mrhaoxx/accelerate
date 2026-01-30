@@ -63,6 +63,7 @@ from .utils import (
     GradientAccumulationPlugin,
     GradScalerKwargs,
     InitProcessGroupKwargs,
+    KTransformersPlugin,
     KwargsHandler,
     LoggerType,
     MegatronLMPlugin,
@@ -214,6 +215,8 @@ class Accelerator:
         megatron_lm_plugin ([`~utils.MegatronLMPlugin`], *optional*):
             Tweak your MegatronLM related args using this argument. This argument is optional and can be configured
             directly using *accelerate config*
+        kt_config ([`~utils.KTransformersPlugin`], *optional*):
+            Enable KTransformers MoE wrapping inside Accelerate.
         rng_types (list of `str` or [`~utils.RNGType`]):
             The list of random number generators to synchronize at the beginning of each iteration in your prepared
             dataloaders. Should be one or several of:
@@ -287,6 +290,7 @@ class Accelerator:
         fsdp_plugin: FullyShardedDataParallelPlugin | None = None,
         torch_tp_plugin: TorchTensorParallelPlugin | None = None,  # Deprecate later, warning in `post_init`
         megatron_lm_plugin: MegatronLMPlugin | None = None,
+        kt_config: KTransformersPlugin | None = None,
         rng_types: list[str | RNGType] | None = None,
         log_with: str | LoggerType | GeneralTracker | list[str | LoggerType | GeneralTracker] | None = None,
         project_dir: str | os.PathLike | None = None,
@@ -411,6 +415,16 @@ class Accelerator:
             if not is_megatron_lm_available():
                 raise ImportError("Megatron is not installed. please build it from source.")
 
+        if kt_config is None:
+            kt_config_candidate = KTransformersPlugin()
+            if kt_config_candidate.enabled:
+                kt_config = kt_config_candidate
+        elif not isinstance(kt_config, KTransformersPlugin):
+            raise TypeError("`kt_config` must be a KTransformersPlugin object.")
+
+        if kt_config is not None and not kt_config.enabled:
+            kt_config = None
+
         # Kwargs handlers
         self.ddp_handler = None
         self.scaler_handler = None
@@ -465,6 +479,7 @@ class Accelerator:
             deepspeed_plugin=deepspeed_plugins,
             fsdp_plugin=fsdp_plugin,
             megatron_lm_plugin=megatron_lm_plugin,
+            kt_config=kt_config,
             parallelism_config=parallelism_config,
             _from_accelerator=True,
             **kwargs,
@@ -1456,6 +1471,11 @@ class Accelerator:
         ... )
         ```
         """
+        kt_plugin = getattr(self.state, "kt_config", None)
+        kt_bypass_device_map = bool(
+            kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check
+        )
+
         if device_placement is None:
             device_placement = [None for _ in args]
         elif self.distributed_type in (DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM):
@@ -1472,6 +1492,7 @@ class Accelerator:
                 and self.verify_device_map(obj)
                 and self.distributed_type != DistributedType.NO
                 and os.environ.get("ACCELERATE_BYPASS_DEVICE_MAP", "false") != "true"
+                and not kt_bypass_device_map
             ):
                 raise ValueError(
                     "You can't train a model that has been loaded with `device_map='auto'` in any distributed mode."
@@ -1649,6 +1670,37 @@ class Accelerator:
         if model_index is None:
             return tuple(result)
 
+        # Apply KT wrapping before FSDP2 wrapping if KT plugin is enabled
+        kt_plugin = getattr(self.state, "kt_config", None)
+        if kt_plugin is not None and kt_plugin.enabled and getattr(model, "_kt_wrappers", None) is None:
+            from .utils.kt_moe import wrap_moe_layers_with_kt_wrapper
+
+            if kt_plugin.wrap_fn is None:
+                wrappers = wrap_moe_layers_with_kt_wrapper(model, kt_plugin)
+            else:
+                wrap_kwargs = kt_plugin.wrap_kwargs or {}
+                wrappers = kt_plugin.wrap_fn(model, kt_plugin, **wrap_kwargs)
+
+            model._kt_wrappers = wrappers
+            model._kt_tp_enabled = bool(kt_plugin.kt_tp_enabled)
+            model._kt_use_lora_experts = bool(kt_plugin.kt_use_lora_experts)
+            moe_lora_params = {}
+            for wrapper in wrappers:
+                if getattr(wrapper, "lora_params", None) is not None:
+                    moe_lora_params[wrapper.layer_idx] = dict(wrapper.lora_params)
+            model._kt_moe_lora_params = moe_lora_params
+
+            # Only ignore the LoRA ParameterDict modules, NOT the whole wrapper.
+            # The wrapper also contains the router and shared_experts which MUST be
+            # sharded by FSDP2.  If we ignore the whole wrapper, model.to("meta")
+            # moves the router to meta, and fsdp2_load_full_state_dict can't
+            # broadcast meta tensors on non-rank-0 → crash.
+            if self.state.fsdp_plugin.ignored_modules is None:
+                self.state.fsdp_plugin.ignored_modules = []
+            for wrapper in wrappers:
+                if wrapper.lora_params is not None and wrapper.lora_params not in self.state.fsdp_plugin.ignored_modules:
+                    self.state.fsdp_plugin.ignored_modules.append(wrapper.lora_params)
+
         # Needs to be done first, to make sure AC + fully_shard will work as expected
         self.state.fsdp_plugin.set_auto_wrap_policy(model)
 
@@ -1667,19 +1719,33 @@ class Accelerator:
         # Get old params and canonicalize - we canonicalize to have the mapping easy
         old_named_params = fsdp2_canonicalize_names(self._get_named_parameters(*tuple(result), drop_refs=True))
 
+        # Collect KT LoRA param data_ptrs to skip them during optimizer param swapping
+        # These params are on CPU and managed by KT kernel, not FSDP2
+        kt_lora_param_ptrs = set()
+        if hasattr(model, '_kt_moe_lora_params') and model._kt_moe_lora_params:
+            for layer_idx, lora_params in model._kt_moe_lora_params.items():
+                for param_name, param in lora_params.items():
+                    if isinstance(param, torch.nn.Parameter):
+                        kt_lora_param_ptrs.add(param.data_ptr())
+
         # Swap the optimizer parameters with empty, so `fully_shard` after will not allocate too much memory
+        # BUT skip KT LoRA params - they should keep their original references
         from torch.distributed.tensor import DTensor
 
+        kt_lora_params_saved = {}  # Save KT LoRA params to restore later
         for obj in result:
             if isinstance(obj, torch.optim.Optimizer):
                 for param_group in obj.param_groups:
                     for i, p in enumerate(param_group["params"]):
+                        p_ptr = p._local_tensor.data_ptr() if isinstance(p, DTensor) else p.data_ptr()
+                        if p_ptr in kt_lora_param_ptrs:
+                            # Keep original KT LoRA param, save for later restoration
+                            kt_lora_params_saved[p_ptr] = p
+                            continue
                         # We drop a reference to the original param here, so that _move_states_to_device triggers a reallocation
                         # We reassign the data_ptr to the original param, so that we preserve the mapping to the new ones
                         param_group["params"][i] = torch.empty(1, dtype=p.dtype, device=p.device)
-                        param_group["params"][i].data_ptr = (
-                            p._local_tensor.data_ptr() if isinstance(p, DTensor) else p.data_ptr()
-                        )
+                        param_group["params"][i].data_ptr = p_ptr
 
         self._models.append(model)
 
@@ -1731,21 +1797,59 @@ class Accelerator:
         >>> model = accelerator.prepare_model(model)
         ```
         """
+        kt_plugin = getattr(self.state, "kt_config", None)
+        kt_bypass_device_map = bool(
+            kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check
+        )
         if device_placement is None:
             device_placement = self.device_placement and self.distributed_type != DistributedType.FSDP
+        if kt_plugin is not None and kt_plugin.enabled and kt_plugin.skip_device_placement:
+            if device_placement:
+                logger.warning("KT plugin enabled; forcing device_placement=False to preserve CPU/GPU placement.")
+            device_placement = False
 
         self._models.append(model)
+
+        if kt_plugin is not None and kt_plugin.enabled:
+            if kt_plugin.require_single_process and self.num_processes != 1:
+                raise ValueError("KT plugin requires single-process execution.")
+            if self.distributed_type not in kt_plugin.allowed_distributed_types:
+                raise ValueError(
+                    f"KT plugin does not support distributed type {self.distributed_type}. "
+                    f"Allowed: {kt_plugin.allowed_distributed_types}"
+                )
+            if self.parallelism_config and (self.parallelism_config.tp_enabled or self.parallelism_config.cp_enabled):
+                raise ValueError("KT plugin is incompatible with TP/CP parallelism in Accelerate.")
 
         # TODO: Look at enabling native TP training directly with a proper config
         if (
             self.verify_device_map(model)
             and self.distributed_type != DistributedType.NO
             and os.environ.get("ACCELERATE_BYPASS_DEVICE_MAP", "false") != "true"
+            and not kt_bypass_device_map
         ):
             raise ValueError(
                 "You can't train a model that has been loaded with `device_map='auto'` in any distributed mode."
                 " Please rerun your script specifying `--num_processes=1` or by launching with `python {{myscript.py}}`."
             )
+
+        if kt_plugin is not None and kt_plugin.enabled and getattr(model, "_kt_wrappers", None) is None:
+            from .utils.kt_moe import wrap_moe_layers_with_kt_wrapper
+
+            if kt_plugin.wrap_fn is None:
+                wrappers = wrap_moe_layers_with_kt_wrapper(model, kt_plugin)
+            else:
+                wrap_kwargs = kt_plugin.wrap_kwargs or {}
+                wrappers = kt_plugin.wrap_fn(model, kt_plugin, **wrap_kwargs)
+
+            model._kt_wrappers = wrappers
+            model._kt_tp_enabled = bool(kt_plugin.kt_tp_enabled)
+            model._kt_use_lora_experts = bool(kt_plugin.kt_use_lora_experts)
+            moe_lora_params = {}
+            for wrapper in wrappers:
+                if getattr(wrapper, "lora_params", None) is not None:
+                    moe_lora_params[wrapper.layer_idx] = dict(wrapper.lora_params)
+            model._kt_moe_lora_params = moe_lora_params
 
         if self.native_amp:
             model._original_forward = model.forward
@@ -2738,6 +2842,36 @@ class Accelerator:
             self.lomo_backward(loss, learning_rate)
         else:
             loss.backward(**kwargs)
+
+        # Ensure KT LoRA params are in the optimizer (they may have been added after optimizer creation)
+        if not getattr(self, "_kt_lora_injected", False):
+            from accelerate.utils.kt_moe import get_kt_lora_params
+            _models = [m for m in self._models if hasattr(m, 'parameters')]
+            if _models:
+                _kt_params = get_kt_lora_params(_models[0])
+                if not _kt_params:
+                    # Try unwrapped model
+                    unwrapped = self.unwrap_model(_models[0])
+                    _kt_params = get_kt_lora_params(unwrapped)
+                if _kt_params and self._optimizers:
+                    opt = self._optimizers[0]
+                    existing_ids = set()
+                    for group in opt.param_groups:
+                        for p in group['params']:
+                            existing_ids.add(id(p))
+                    missing = [p for p in _kt_params if id(p) not in existing_ids]
+                    if missing:
+                        # Add as a new param group with the same lr as the first group
+                        lr = opt.param_groups[0].get('lr', 1e-4)
+                        opt.add_param_group({'params': missing, 'lr': lr})
+                        print(f"\033[32m[KT] Added {len(missing)} KT LoRA params to optimizer (lr={lr})\033[0m",
+                              flush=True)
+                    self._kt_lora_injected = True
+                else:
+                    print(f"\033[31m[KT] No KT params found or no optimizers. "
+                          f"models={len(_models)} kt_params={len(_kt_params) if _kt_params else 0} "
+                          f"optimizers={len(self._optimizers)}\033[0m", flush=True)
+                    self._kt_lora_injected = True  # Don't retry
 
     def set_trigger(self):
         """
