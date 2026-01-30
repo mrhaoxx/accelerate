@@ -1143,60 +1143,97 @@ class KTMoEFunction(torch.autograd.Function):
         import torch.distributed as dist
         dist_on = dist.is_initialized() and dist.get_world_size() > 1
         rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist_on else 1
 
-        # print("rank", rank, "hs_mean", hidden_states.float().mean().item(),
-        #     "hs_sum", hidden_states.float().sum().item())
         ctx.use_broadcast = wrapper is None
 
-        if KT_DEBUG and dist_on:
-            logger.warning("\033[36m[KT DEBUG] rank %s KTMoEFunction.forward sync all_reduce start\033[0m", rank)
-            sync_tensor = torch.zeros(1, device=hidden_states.device, dtype=torch.int32)
-            dist.all_reduce(sync_tensor)
-            logger.warning("\033[36m[KT DEBUG] rank %s KTMoEFunction.forward sync all_reduce done\033[0m", rank)
-
-        if KT_DEBUG:
-            logger.warning(
-                "[KT DEBUG] rank %s KTMoEFunction.forward start layer=%s hidden=%s %s topk_ids=%s %s "
-                "topk_weights=%s %s precomputed=%s use_broadcast=%s",
-                rank,
-                layer_idx,
-                tuple(hidden_states.shape),
-                hidden_states.dtype,
-                tuple(topk_ids.shape),
-                topk_ids.dtype,
-                tuple(topk_weights.shape),
-                topk_weights.dtype,
-                precomputed_output is not None,
-                ctx.use_broadcast,
-            )
-
         if precomputed_output is not None:
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.forward using precomputed_output=%s %s",
-                    rank,
-                    tuple(precomputed_output.shape),
-                    precomputed_output.dtype,
-                )
             output = precomputed_output
+        elif dist_on:
+            # ---- Data-parallel gather/scatter path ----
+            # Each rank has its own batch. Gather all on rank 0, compute, scatter back.
+            # Both batch_size and seq_len may differ across ranks.
+
+            # 1. Exchange (batch_size, seq_len) from each rank
+            local_BS = torch.tensor([batch_size, seq_len], device=original_device, dtype=torch.int64)
+            all_BS = [torch.empty(2, device=original_device, dtype=torch.int64) for _ in range(world_size)]
+            dist.all_gather(all_BS, local_BS)
+            BS_list = [(int(bs[0].item()), int(bs[1].item())) for bs in all_BS]
+            B_max = max(b for b, s in BS_list)
+            S_max = max(s for b, s in BS_list)
+            qlen_max = B_max * S_max
+
+            # 2. Pad hidden_states to [B_max, S_max, H], topk to [qlen_max, K]
+            def _pad_2d(t, B_max, S_max, B, S):
+                """Pad a [B, S, ...] tensor to [B_max, S_max, ...]."""
+                if B == B_max and S == S_max:
+                    return t.contiguous()
+                # First pad S dim
+                if S < S_max:
+                    pad_shape = list(t.shape)
+                    pad_shape[1] = S_max - S
+                    t = torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=1)
+                # Then pad B dim
+                if B < B_max:
+                    pad_shape = list(t.shape)
+                    pad_shape[0] = B_max - B
+                    t = torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0)
+                return t.contiguous()
+
+            def _pad_flat(t, qlen_max, qlen_local):
+                """Pad a [qlen, ...] tensor to [qlen_max, ...]."""
+                if qlen_local == qlen_max:
+                    return t.contiguous()
+                pad_shape = list(t.shape)
+                pad_shape[0] = qlen_max - qlen_local
+                return torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0).contiguous()
+
+            hs_padded = _pad_2d(hidden_states, B_max, S_max, batch_size, seq_len)  # [B_max, S_max, H]
+            ids_padded = _pad_flat(topk_ids, qlen_max, qlen)        # [qlen_max, K]
+            wts_padded = _pad_flat(topk_weights, qlen_max, qlen)    # [qlen_max, K]
+
+            # 3. Gather on rank 0
+            if rank == 0:
+                gathered_hs = [torch.empty_like(hs_padded) for _ in range(world_size)]
+                gathered_ids = [torch.empty_like(ids_padded) for _ in range(world_size)]
+                gathered_wts = [torch.empty_like(wts_padded) for _ in range(world_size)]
+            else:
+                gathered_hs = gathered_ids = gathered_wts = None
+
+            dist.gather(hs_padded, gathered_hs, dst=0)
+            dist.gather(ids_padded, gathered_ids, dst=0)
+            dist.gather(wts_padded, gathered_wts, dst=0)
+
+            # 4. Rank 0: run KT kernel on full gathered batch
+            if rank == 0:
+                all_hs = torch.cat(gathered_hs, dim=0)   # [B_max*W, S_max, H]
+                all_ids = torch.cat(gathered_ids, dim=0)  # [qlen_max*W, K]
+                all_wts = torch.cat(gathered_wts, dim=0)  # [qlen_max*W, K]
+                total_qlen = qlen_max * world_size
+
+                all_output = wrapper.forward_sft(
+                    hidden_states=all_hs.view(total_qlen, hidden_size),
+                    expert_ids=all_ids.view(total_qlen, num_experts_per_tok),
+                    weights=all_wts.view(total_qlen, num_experts_per_tok),
+                    save_for_backward=training,
+                    output_device=original_device,
+                )
+                all_output = all_output.view(B_max * world_size, S_max, hidden_size).to(dtype=original_dtype)
+                scatter_list = list(all_output.chunk(world_size, dim=0))
+                scatter_list = [c.contiguous() for c in scatter_list]
+            else:
+                scatter_list = None
+
+            # 5. Scatter back and trim to local (B, S)
+            output_padded = torch.empty(B_max, S_max, hidden_size, device=original_device, dtype=original_dtype)
+            dist.scatter(output_padded, scatter_list, src=0)
+            output = output_padded[:batch_size, :seq_len]  # trim both B and S padding
         elif wrapper is not None:
+            # ---- Single-GPU path ----
             input_flat = hidden_states.view(qlen, hidden_size)
             expert_ids = topk_ids.view(qlen, num_experts_per_tok)
             weights = topk_weights.view(qlen, num_experts_per_tok)
 
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.forward wrapper.forward_sft input_flat=%s %s "
-                    "expert_ids=%s %s weights=%s %s output_device=%s",
-                    rank,
-                    tuple(input_flat.shape),
-                    input_flat.dtype,
-                    tuple(expert_ids.shape),
-                    expert_ids.dtype,
-                    tuple(weights.shape),
-                    weights.dtype,
-                    original_device,
-                )
             output = wrapper.forward_sft(
                 hidden_states=input_flat,
                 expert_ids=expert_ids,
@@ -1204,18 +1241,12 @@ class KTMoEFunction(torch.autograd.Function):
                 save_for_backward=training,
                 output_device=original_device,
             )
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.forward wrapper.forward_sft done output=%s %s",
-                    rank,
-                    tuple(output.shape),
-                    output.dtype,
-                )
             output = output.view(batch_size, seq_len, hidden_size).to(dtype=original_dtype)
         else:
             output = torch.empty(
                 batch_size, seq_len, hidden_size, device=original_device, dtype=original_dtype
             )
+
         ctx.wrapper = wrapper
         ctx.lora_params = lora_params
         ctx.hidden_size = hidden_size
@@ -1229,80 +1260,110 @@ class KTMoEFunction(torch.autograd.Function):
         ctx.weights_shape = topk_weights.shape
         ctx.weights_dtype = topk_weights.dtype
         ctx.weights_device = topk_weights.device
+        ctx.dist_on = dist_on
+        ctx.world_size = world_size
+        ctx.num_experts_per_tok = num_experts_per_tok
 
-        if KT_DEBUG:
-            logger.warning(
-                "[KT DEBUG] rank %s KTMoEFunction.forward layer=%s use_broadcast=%s training=%s train_lora=%s "
-                "hidden=%s %s topk_weights=%s %s precomputed=%s",
-                rank,
-                layer_idx,
-                ctx.use_broadcast,
-                training,
-                train_lora,
-                tuple(hidden_states.shape),
-                hidden_states.dtype,
-                tuple(topk_weights.shape),
-                topk_weights.dtype,
-                precomputed_output is not None,
-            )
-        if dist_on:
-            output = output.contiguous()
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.forward broadcast output=%s %s start %s %s",
-                    rank,
-                    tuple(output.shape),
-                    output.dtype, output.mean().item(), output.sum().item(),
-                )
-            dist.broadcast(output, src=0)
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.forward broadcast output done %s %s",
-                    rank, output.mean().item(), output.sum().item()
-                )
         return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         qlen = ctx.qlen
         hidden_size = ctx.hidden_size
+        batch_size = ctx.batch_size
+        seq_len = ctx.seq_len
+        dist_on = ctx.dist_on
+        world_size = ctx.world_size
+        num_experts_per_tok = ctx.num_experts_per_tok
 
         import torch.distributed as dist
-        dist_on = dist.is_initialized() and dist.get_world_size() > 1
         rank = dist.get_rank() if dist.is_initialized() else 0
 
-        if KT_DEBUG and dist_on:
-            logger.warning("\033[33m[KT DEBUG] rank %s KTMoEFunction.backward sync all_reduce start\033[0m", rank)
         if dist_on:
-            sync_tensor = torch.zeros(1, device=grad_output.device, dtype=torch.int32)
-            dist.all_reduce(sync_tensor)
-        if KT_DEBUG and dist_on:
-            logger.warning("\033[33m[KT DEBUG] rank %s KTMoEFunction.backward sync all_reduce done\033[0m", rank)
+            # ---- Data-parallel gather/scatter backward ----
+            # Both batch_size and seq_len may differ across ranks.
 
-        grad_output_flat = grad_output.view(qlen, hidden_size)
+            # 1. Exchange (batch_size, seq_len) from each rank
+            local_BS = torch.tensor([batch_size, seq_len], device=ctx.original_device, dtype=torch.int64)
+            all_BS = [torch.empty(2, device=ctx.original_device, dtype=torch.int64) for _ in range(world_size)]
+            dist.all_gather(all_BS, local_BS)
+            BS_list = [(int(bs[0].item()), int(bs[1].item())) for bs in all_BS]
+            B_max = max(b for b, s in BS_list)
+            S_max = max(s for b, s in BS_list)
+            qlen_max = B_max * S_max
 
-        if KT_DEBUG:
-            logger.warning(
-                "[KT DEBUG] rank %s KTMoEFunction.backward start layer=%s grad_output=%s %s use_broadcast=%s",
-                rank,
-                ctx.layer_idx,
-                tuple(grad_output.shape),
-                grad_output.dtype,
-                ctx.use_broadcast,
-            )
+            # 2. Pad grad_output to [B_max, S_max, H]
+            def _pad_2d(t, B_max, S_max, B, S):
+                if B == B_max and S == S_max:
+                    return t.contiguous()
+                if S < S_max:
+                    pad_shape = list(t.shape)
+                    pad_shape[1] = S_max - S
+                    t = torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=1)
+                if B < B_max:
+                    pad_shape = list(t.shape)
+                    pad_shape[0] = B_max - B
+                    t = torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0)
+                return t.contiguous()
 
-        if not ctx.use_broadcast:
-            lora_params_for_backward = ctx.lora_params if ctx.train_lora else None
-            # wrapper.backward() may return (grad_input, grad_loras_dict, grad_weights) or (grad_input, grad_weights)
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.backward wrapper.backward grad_output_flat=%s %s "
-                    "lora_params=%s",
-                    rank,
-                    tuple(grad_output_flat.shape),
-                    grad_output_flat.dtype,
-                    lora_params_for_backward is not None,
+            grad_out_padded = _pad_2d(grad_output, B_max, S_max, batch_size, seq_len)
+
+            # 3. Gather on rank 0
+            if rank == 0:
+                gathered_go = [torch.empty_like(grad_out_padded) for _ in range(world_size)]
+            else:
+                gathered_go = None
+            dist.gather(grad_out_padded, gathered_go, dst=0)
+
+            # 4. Rank 0: run backward on full gathered batch
+            if rank == 0:
+                all_go = torch.cat(gathered_go, dim=0)  # [B_max*W, S_max, H]
+                total_qlen = qlen_max * world_size
+                all_go_flat = all_go.view(total_qlen, hidden_size)
+
+                lora_params_for_backward = ctx.lora_params if ctx.train_lora else None
+                backward_out = ctx.wrapper.backward(
+                    all_go_flat,
+                    lora_params=lora_params_for_backward,
+                    output_device=ctx.original_device,
                 )
+                if isinstance(backward_out, tuple) and len(backward_out) == 2:
+                    all_grad_input, all_grad_weights = backward_out
+                    grad_loras = None
+                elif isinstance(backward_out, tuple) and len(backward_out) == 3:
+                    all_grad_input, grad_loras, all_grad_weights = backward_out
+                else:
+                    raise ValueError("KTMoEWrapper.backward returned unexpected format.")
+
+                # all_grad_input: [total_qlen, H] → [B_max*W, S_max, H]
+                all_grad_input = all_grad_input.view(B_max * world_size, S_max, hidden_size)
+                all_grad_input = all_grad_input.to(dtype=ctx.original_dtype)
+
+                # all_grad_weights: [total_qlen, K] → [qlen_max*W, K] — scatter as flat
+                all_grad_weights = all_grad_weights.to(dtype=torch.bfloat16)
+
+                scatter_gi = list(all_grad_input.chunk(world_size, dim=0))
+                scatter_gi = [c.contiguous() for c in scatter_gi]
+                # Split grad_weights into per-rank chunks of qlen_max each
+                scatter_gw = list(all_grad_weights.view(world_size, qlen_max, -1).unbind(0))
+                scatter_gw = [c.contiguous() for c in scatter_gw]
+            else:
+                scatter_gi = None
+                scatter_gw = None
+                grad_loras = None
+
+            # 5. Scatter back and trim
+            gi_padded = torch.empty(B_max, S_max, hidden_size, device=ctx.original_device, dtype=ctx.original_dtype)
+            gw_padded = torch.empty(qlen_max, num_experts_per_tok, device=ctx.weights_device, dtype=torch.bfloat16)
+            dist.scatter(gi_padded, scatter_gi, src=0)
+            dist.scatter(gw_padded, scatter_gw, src=0)
+            grad_input = gi_padded[:batch_size, :seq_len]
+            grad_weights = gw_padded[:qlen].view(ctx.weights_shape).to(dtype=ctx.weights_dtype)
+
+        elif not ctx.use_broadcast:
+            # ---- Single-GPU path ----
+            grad_output_flat = grad_output.view(qlen, hidden_size)
+            lora_params_for_backward = ctx.lora_params if ctx.train_lora else None
             backward_out = ctx.wrapper.backward(
                 grad_output_flat,
                 lora_params=lora_params_for_backward,
@@ -1314,94 +1375,16 @@ class KTMoEFunction(torch.autograd.Function):
             elif isinstance(backward_out, tuple) and len(backward_out) == 3:
                 grad_input, grad_loras, grad_weights = backward_out
             else:
-                raise ValueError(
-                    "KTMoEWrapper.backward returned unexpected output format; expected 2 or 3 tensors."
-                )
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.backward wrapper.backward done grad_input=%s %s "
-                    "grad_weights=%s %s grad_loras=%s",
-                    rank,
-                    tuple(grad_input.shape),
-                    grad_input.dtype,
-                    tuple(grad_weights.shape),
-                    grad_weights.dtype,
-                    grad_loras is not None,
-                )
-                if grad_loras is not None:
-                    for key, gt in grad_loras.items():
-                        logger.warning(
-                            "\033[33m[KT DEBUG] rank %s backward grad_loras[%s] "
-                            "shape=%s dtype=%s device=%s "
-                            "norm=%.6f mean=%.6f abs_max=%.6f abs_min=%.6f\033[0m",
-                            rank, key,
-                            tuple(gt.shape), gt.dtype, gt.device,
-                            gt.float().norm().item(),
-                            gt.float().mean().item(),
-                            gt.float().abs().max().item(),
-                            gt.float().abs().min().item(),
-                        )
+                raise ValueError("KTMoEWrapper.backward returned unexpected format.")
+            grad_input = grad_input.view(batch_size, seq_len, hidden_size).to(dtype=ctx.original_dtype)
+            grad_weights = grad_weights.to(dtype=torch.bfloat16)
         else:
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.backward alloc empty grads for broadcast",
-                    rank,
-                )
-            grad_input = torch.empty(
-                ctx.batch_size * ctx.seq_len, hidden_size, device=ctx.original_device, dtype=ctx.original_dtype
-            )
-            grad_weights = torch.empty(ctx.weights_shape, device=ctx.weights_device, dtype=ctx.weights_dtype)
+            # No wrapper, no dist — shouldn't happen in normal flow
+            grad_input = torch.zeros(batch_size, seq_len, hidden_size, device=ctx.original_device, dtype=ctx.original_dtype)
+            grad_weights = torch.zeros(ctx.weights_shape, device=ctx.weights_device, dtype=ctx.weights_dtype)
             grad_loras = None
 
-        grad_input = grad_input.view(ctx.batch_size, ctx.seq_len, hidden_size)
-        grad_input = grad_input.to(dtype=ctx.original_dtype)
-        grad_weights = grad_weights.to(dtype=torch.bfloat16)
-
-        # Broadcast grad_input and grad_weights to other ranks so they can propagate
-        # consistent gradients without running KT backward.
-        if dist_on:
-            grad_input = grad_input.contiguous()
-            grad_weights = grad_weights.contiguous()
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.backward broadcast grad_input=%s %s start",
-                    rank,
-                    tuple(grad_input.shape),
-                    grad_input.dtype,
-                )
-            dist.broadcast(grad_input, src=0)
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.backward broadcast grad_input done",
-                    rank,
-                )
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.backward broadcast grad_weights=%s %s start",
-                    rank,
-                    tuple(grad_weights.shape),
-                    grad_weights.dtype,
-                )
-            dist.broadcast(grad_weights, src=0)
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoEFunction.backward broadcast grad_weights done",
-                    rank,
-                )
-        if KT_DEBUG:
-            logger.warning(
-                "[KT DEBUG] rank %s KTMoEFunction.backward use_broadcast=%s grad_output=%s %s "
-                "grad_input=%s %s grad_weights=%s %s",
-                rank,
-                ctx.use_broadcast,
-                tuple(grad_output.shape),
-                grad_output.dtype,
-                tuple(grad_input.shape),
-                grad_input.dtype,
-                tuple(grad_weights.shape),
-                grad_weights.dtype,
-            )
-
+        # LoRA gradients: broadcast from rank 0 (computed on full batch)
         lora_keys = []
         if ctx.train_lora and ctx.lora_params is not None:
             lora_keys = [k for k, p in ctx.lora_params.items() if p.requires_grad]
@@ -1423,8 +1406,7 @@ class KTMoEFunction(torch.autograd.Function):
                 grad_loras[key] = grad_tensor
                 dist.broadcast(grad_tensor, src=0)
 
-        # Copy LoRA gradients to the Parameter's .grad attributes
-        # This is critical for the optimizer to update LoRA weights
+        # Copy LoRA gradients to Parameter.grad
         if ctx.train_lora and ctx.lora_params is not None and grad_loras is not None:
             for key in lora_keys:
                 param = ctx.lora_params[key]
@@ -1434,47 +1416,11 @@ class KTMoEFunction(torch.autograd.Function):
                 if grad_tensor is None:
                     continue
                 if param.requires_grad:
-                    # Clone the gradient to avoid buffer reuse issues in KT kernel
                     grad_cloned = grad_tensor.clone().to(dtype=param.dtype, device=param.device)
-                    # Accumulate gradients (in case of gradient accumulation)
                     if param.grad is None:
                         param.grad = grad_cloned
                     else:
                         param.grad = param.grad + grad_cloned
-                        
-                # print(rank, "LoRA grad", type(param), key, grad_tensor.float().mean().item(), grad_tensor.float().sum().item())
-
-        # # Debug: print brief grad summary
-        # if ctx.train_lora and ctx.lora_params is not None:
-        #     for key in lora_keys:
-        #         param = ctx.lora_params[key]
-        #         g = param.grad
-        #         g_norm = g.float().norm().item() if g is not None else -1.0
-        #         p_norm = param.data.float().norm().item()
-        #         print(f"[GRAD CHECK L{ctx.layer_idx}] {key}: param_norm={p_norm:.6f} grad_norm={g_norm:.6f} "
-        #               f"requires_grad={param.requires_grad} id={id(param)}", flush=True)
-
-        if KT_DEBUG and ctx.train_lora and ctx.lora_params is not None:
-            for key in lora_keys:
-                param = ctx.lora_params[key]
-                g = param.grad
-                if g is not None:
-                    logger.warning(
-                        "\033[32m[KT DEBUG] rank %s backward after_copy param.grad[%s] "
-                        "norm=%.6f mean=%.6f abs_max=%.6f abs_min=%.6f "
-                        "dtype=%s device=%s\033[0m",
-                        rank, key,
-                        g.float().norm().item(),
-                        g.float().mean().item(),
-                        g.float().abs().max().item(),
-                        g.float().abs().min().item(),
-                        g.dtype, g.device,
-                    )
-                else:
-                    logger.warning(
-                        "\033[31m[KT DEBUG] rank %s backward after_copy param.grad[%s]=None\033[0m",
-                        rank, key,
-                    )
 
         return grad_input, None, grad_weights, None, None, None, None, None, None, None, None, None
 
@@ -1583,7 +1529,7 @@ class KTMoELayerWrapper(nn.Module):
             )
 
         if KT_DEBUG and dist_on:
-            # The broadcast-based KT path assumes identical activations across ranks (TP-replicated inputs).
+            # Log shapes across ranks (batch dim may differ in DP mode, that's expected)
             shape_t = torch.tensor(tuple(hidden_states.shape), device=hidden_states.device, dtype=torch.int32)
             gathered = [torch.empty_like(shape_t) for _ in range(dist.get_world_size())]
             dist.all_gather(gathered, shape_t)
@@ -1594,15 +1540,6 @@ class KTMoELayerWrapper(nn.Module):
                     self.layer_idx,
                     shapes,
                 )
-            if any(s != shapes[0] for s in shapes):
-                msg = (
-                    f"[KT ERROR] layer={self.layer_idx} hidden_states shape mismatch across ranks "
-                    f"(broadcast path requires identical inputs). local={tuple(hidden_states.shape)} all={shapes}. "
-                    "If you're running TP-only, ensure the same batch (incl. padding/seq_len) is replicated on all ranks "
-                    "(e.g., dispatch_batches=True / avoid per-rank dataloader sharding)."
-                )
-                logger.error("\033[31m%s\033[0m", msg)
-                raise RuntimeError(msg)
 
         if KT_DEBUG:
             logger.warning(
@@ -1652,6 +1589,7 @@ class KTMoELayerWrapper(nn.Module):
             self.update_lora_pointers()
             self._lora_pointers_dirty = False
 
+        # Overlap: rank 0 submits CPU expert work, all ranks compute GPU shared_experts concurrently
         use_overlap = (not use_broadcast) and has_gpu_components and save_for_backward
         if KT_DEBUG:
             logger.warning(
@@ -1696,7 +1634,9 @@ class KTMoELayerWrapper(nn.Module):
 
         precomputed_output = None
         gpu_output = None
-        if self.wrapper is not None and use_overlap:
+        # In dist mode, all ranks must participate in overlap (gather/scatter collectives).
+        # In single-GPU mode, only rank 0 (which has wrapper) uses overlap.
+        if use_overlap and (dist_on or self.wrapper is not None):
             if KT_DEBUG:
                 logger.warning(
                     "[KT DEBUG] rank %s KTMoELayerWrapper.forward overlap path start layer=%s",
@@ -1788,84 +1728,104 @@ class KTMoELayerWrapper(nn.Module):
         compute_gpu_output: Any,
         save_for_backward: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        import torch.distributed as dist
+
         batch_size, seq_len, _ = hidden_states.shape
         original_device = hidden_states.device
         original_dtype = hidden_states.dtype
 
+        dist_on = dist.is_initialized() and dist.get_world_size() > 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist_on else 1
+
         qlen = batch_size * seq_len
-        input_flat = hidden_states.view(qlen, self.hidden_size)
-        expert_ids = topk_ids.view(qlen, self.moe_config.num_experts_per_tok)
-        weights = topk_weights.view(qlen, self.moe_config.num_experts_per_tok)
 
-        if KT_DEBUG:
-            import torch.distributed as dist
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            logger.warning(
-                "[KT DEBUG] rank %s KTMoELayerWrapper._forward_with_overlap start layer=%s "
-                "input_flat=%s %s expert_ids=%s %s weights=%s %s",
-                rank,
-                self.layer_idx,
-                tuple(input_flat.shape),
-                input_flat.dtype,
-                tuple(expert_ids.shape),
-                expert_ids.dtype,
-                tuple(weights.shape),
-                weights.dtype,
-            )
+        if dist_on:
+            # ---- Gather inputs from all ranks before submitting CPU work ----
+            # Both batch_size and seq_len may differ across ranks.
+            local_BS = torch.tensor([batch_size, seq_len], device=original_device, dtype=torch.int64)
+            all_BS = [torch.empty(2, device=original_device, dtype=torch.int64) for _ in range(world_size)]
+            dist.all_gather(all_BS, local_BS)
+            BS_list = [(int(bs[0].item()), int(bs[1].item())) for bs in all_BS]
+            B_max = max(b for b, s in BS_list)
+            S_max = max(s for b, s in BS_list)
+            qlen_max = B_max * S_max
 
-        if KT_DEBUG:
-            import torch.distributed as dist
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            logger.warning(
-                "[KT DEBUG] rank %s KTMoELayerWrapper._forward_with_overlap submit_forward_sft start layer=%s",
-                rank,
-                self.layer_idx,
-            )
-        self.wrapper.submit_forward_sft(input_flat, expert_ids, weights, save_for_backward=save_for_backward)
-        if KT_DEBUG:
-            import torch.distributed as dist
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            logger.warning(
-                "[KT DEBUG] rank %s KTMoELayerWrapper._forward_with_overlap submit_forward_sft done layer=%s",
-                rank,
-                self.layer_idx,
-            )
+            def _pad_2d(t, B_max, S_max, B, S):
+                if B == B_max and S == S_max:
+                    return t.contiguous()
+                if S < S_max:
+                    pad_shape = list(t.shape)
+                    pad_shape[1] = S_max - S
+                    t = torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=1)
+                if B < B_max:
+                    pad_shape = list(t.shape)
+                    pad_shape[0] = B_max - B
+                    t = torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0)
+                return t.contiguous()
 
-        gpu_output = compute_gpu_output()
+            def _pad_flat(t, qlen_max, qlen_local):
+                if qlen_local == qlen_max:
+                    return t.contiguous()
+                pad_shape = list(t.shape)
+                pad_shape[0] = qlen_max - qlen_local
+                return torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0).contiguous()
 
-        if KT_DEBUG:
-            import torch.distributed as dist
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            logger.warning(
-                "[KT DEBUG] rank %s KTMoELayerWrapper._forward_with_overlap sync_forward_sft start layer=%s",
-                rank,
-                self.layer_idx,
-            )
-        cpu_output_gpu = self.wrapper.sync_forward_sft(output_device=original_device)
-        if KT_DEBUG:
-            import torch.distributed as dist
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            logger.warning(
-                "[KT DEBUG] rank %s KTMoELayerWrapper._forward_with_overlap sync_forward_sft done layer=%s "
-                "cpu_output_gpu=%s %s",
-                rank,
-                self.layer_idx,
-                tuple(cpu_output_gpu.shape),
-                cpu_output_gpu.dtype,
-            )
-        cpu_output_gpu = cpu_output_gpu.view(batch_size, seq_len, self.hidden_size).to(dtype=original_dtype)
+            hs_padded = _pad_2d(hidden_states, B_max, S_max, batch_size, seq_len)
+            ids_padded = _pad_flat(topk_ids, qlen_max, qlen)
+            wts_padded = _pad_flat(topk_weights, qlen_max, qlen)
 
-        if KT_DEBUG:
-            import torch.distributed as dist
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            logger.warning(
-                "[KT DEBUG] rank %s KTMoELayerWrapper._forward_with_overlap done layer=%s precomputed=%s %s",
-                rank,
-                self.layer_idx,
-                tuple(cpu_output_gpu.shape),
-                cpu_output_gpu.dtype,
-            )
-        return cpu_output_gpu, gpu_output
+            if rank == 0:
+                gathered_hs = [torch.empty_like(hs_padded) for _ in range(world_size)]
+                gathered_ids = [torch.empty_like(ids_padded) for _ in range(world_size)]
+                gathered_wts = [torch.empty_like(wts_padded) for _ in range(world_size)]
+            else:
+                gathered_hs = gathered_ids = gathered_wts = None
+
+            dist.gather(hs_padded, gathered_hs, dst=0)
+            dist.gather(ids_padded, gathered_ids, dst=0)
+            dist.gather(wts_padded, gathered_wts, dst=0)
+
+            # Rank 0: submit async CPU work on gathered full batch
+            if rank == 0:
+                all_hs = torch.cat(gathered_hs, dim=0)
+                all_ids = torch.cat(gathered_ids, dim=0)
+                all_wts = torch.cat(gathered_wts, dim=0)
+                total_qlen = qlen_max * world_size
+
+                input_flat = all_hs.view(total_qlen, self.hidden_size)
+                expert_ids = all_ids.view(total_qlen, self.moe_config.num_experts_per_tok)
+                weights = all_wts.view(total_qlen, self.moe_config.num_experts_per_tok)
+
+                self.wrapper.submit_forward_sft(input_flat, expert_ids, weights, save_for_backward=save_for_backward)
+
+            # All ranks: compute GPU shared_experts on local data concurrently
+            gpu_output = compute_gpu_output()
+
+            # Rank 0: sync CPU result and scatter back
+            if rank == 0:
+                cpu_output_gpu = self.wrapper.sync_forward_sft(output_device=original_device)
+                cpu_output_gpu = cpu_output_gpu.view(B_max * world_size, S_max, self.hidden_size).to(dtype=original_dtype)
+                scatter_list = list(cpu_output_gpu.chunk(world_size, dim=0))
+                scatter_list = [c.contiguous() for c in scatter_list]
+            else:
+                scatter_list = None
+
+            output_padded = torch.empty(B_max, S_max, self.hidden_size, device=original_device, dtype=original_dtype)
+            dist.scatter(output_padded, scatter_list, src=0)
+            precomputed_output = output_padded[:batch_size, :seq_len]
+        else:
+            # ---- Single-GPU overlap path ----
+            input_flat = hidden_states.view(qlen, self.hidden_size)
+            expert_ids = topk_ids.view(qlen, self.moe_config.num_experts_per_tok)
+            weights = topk_weights.view(qlen, self.moe_config.num_experts_per_tok)
+
+            self.wrapper.submit_forward_sft(input_flat, expert_ids, weights, save_for_backward=save_for_backward)
+            gpu_output = compute_gpu_output()
+            cpu_output_gpu = self.wrapper.sync_forward_sft(output_device=original_device)
+            precomputed_output = cpu_output_gpu.view(batch_size, seq_len, self.hidden_size).to(dtype=original_dtype)
+
+        return precomputed_output, gpu_output
 
     def update_lora_pointers(self):
         # Skip if wrapper is None (non-rank-0 processes)
@@ -1955,14 +1915,6 @@ class KTMoELayerWrapper(nn.Module):
             for key, param in self.lora_params.items():
                 wrapper_attr = getattr(self.wrapper, key, None)
                 if wrapper_attr is not None:
-                    logger.warning(
-                        "\033[36m[KT DEBUG] update_lora_pointers layer=%s %s "
-                        "param.data ptr=%s norm=%.6f | wrapper ptr=%s norm=%.6f | same_storage=%s\033[0m",
-                        self.layer_idx, key,
-                        param.data.data_ptr(), param.data.float().norm().item(),
-                        wrapper_attr.data_ptr(), wrapper_attr.float().norm().item(),
-                        param.data.data_ptr() == wrapper_attr.data_ptr(),
-                    )
                     wrapper_attr.copy_(param.data)
 
         if KT_DEBUG:

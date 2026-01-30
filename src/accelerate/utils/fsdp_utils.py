@@ -488,23 +488,12 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
         if full_keys != meta_keys:
             missing_in_full = sorted(meta_keys - full_keys)
             extra_in_full = sorted(full_keys - meta_keys)
-            logger.warning(
-                "[FSDP2 DEBUG] state_dict key mismatch: "
-                f"meta-only={len(missing_in_full)}, full-only={len(extra_in_full)}"
-            )
             if missing_in_full:
-                logger.warning(f"[FSDP2 DEBUG] meta-only sample: {missing_in_full[:20]}")
+                logger.debug(f"fsdp2_load_full_state_dict: meta-only keys: {missing_in_full[:10]}")
             if extra_in_full:
-                logger.warning(f"[FSDP2 DEBUG] full-only sample: {extra_in_full[:20]}")
+                logger.debug(f"fsdp2_load_full_state_dict: full-only keys: {extra_in_full[:10]}")
 
     rank = dist.get_rank() if dist.is_initialized() else 0
-    color = '\033[33m'
-    reset = '\033[0m'
-    meta_keys_list = list(meta_sharded_sd.keys())
-    lora_keys = [k for k in meta_keys_list if 'lora_' in k]
-    logger.warning(f"{color}[FSDP2 DEBUG] rank {rank}: meta_sd keys={len(meta_keys_list)}, lora_keys={len(lora_keys)}{reset}")
-    if lora_keys:
-        logger.warning(f"{color}[FSDP2 DEBUG] rank {rank}: lora key sample: {lora_keys[:20]}{reset}")
 
     # Rank 0 distributes the full state dict to other ranks
     def _infer_parameter_dtype(model, param_name, empty_param):
@@ -538,21 +527,6 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
 
     meta_items = list(meta_sharded_sd.items())
     if accelerator.is_main_process:
-        full_keys_list = list(full_sd.keys())
-        meta_keys_list = list(meta_sharded_sd.keys())
-        logger.warning(f"[FSDP2 DEBUG] rank 0: full_sd first keys: {full_keys_list[:20]}")
-        logger.warning(f"[FSDP2 DEBUG] rank 0: meta_sd first keys: {meta_keys_list[:20]}")
-        first_mismatch = None
-        for i, (fk, mk) in enumerate(zip(full_keys_list, meta_keys_list)):
-            if fk != mk:
-                first_mismatch = (i, fk, mk)
-                break
-        if first_mismatch is not None:
-            i, fk, mk = first_mismatch
-            logger.warning(
-                f"[FSDP2 DEBUG] rank 0: first key order mismatch at index {i}: "
-                f"full={fk}, meta={mk}"
-            )
         for meta_name, sharded_param in meta_items:
             if meta_name not in full_sd:
                 raise KeyError(f"fsdp2_load_full_state_dict: missing key in full_sd: {meta_name}")
@@ -703,16 +677,6 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
     fsdp2_plugin.set_auto_wrap_policy(model)
 
     original_sd = model.state_dict()
-
-    # Debug: print state_dict info
-    import logging
-    _fsdp_logger = logging.getLogger(__name__)
-    total_size = sum(v.numel() * v.element_size() for v in original_sd.values())
-    _fsdp_logger.info(f"[FSDP2 DEBUG] original_sd total size: {total_size / 1024**3:.2f} GB, num keys: {len(original_sd)}")
-    # Find largest params
-    sorted_params = sorted(original_sd.items(), key=lambda x: x[1].numel(), reverse=True)[:10]
-    for name, param in sorted_params:
-        _fsdp_logger.info(f"[FSDP2 DEBUG]   {name}: {param.shape}, {param.numel() * param.element_size() / 1024**2:.2f} MB, device={param.device}")
 
     mesh = getattr(accelerator, "torch_device_mesh", None)
 
