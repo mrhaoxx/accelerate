@@ -2784,7 +2784,7 @@ class KTransformersPlugin:
             Whether KT TP mode is enabled.
         kt_threadpool_count (`int`, defaults to 1):
             Threadpool count when kt_tp_enabled is True.
-        kt_max_cache_depth (`int`, defaults to 1):
+        kt_max_cache_depth (`int`, defaults to 2):
             KT wrapper cache depth.
         kt_weight_path (`str`, defaults to None):
             Path to preprocessed INT8 weights.
@@ -2878,7 +2878,7 @@ class KTransformersPlugin:
             self.kt_threadpool_count = self._get_env_int("ACCELERATE_KT_THREADPOOL_COUNT", 1)
 
         if self.kt_max_cache_depth is None:
-            self.kt_max_cache_depth = self._get_env_int("ACCELERATE_KT_MAX_CACHE_DEPTH", 8)
+            self.kt_max_cache_depth = self._get_env_int("ACCELERATE_KT_MAX_CACHE_DEPTH", 2)
 
         if self.kt_weight_path is None:
             self.kt_weight_path = os.environ.get("ACCELERATE_KT_WEIGHT_PATH", None)

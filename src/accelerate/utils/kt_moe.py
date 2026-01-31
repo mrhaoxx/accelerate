@@ -2041,16 +2041,12 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
 
         if is_rank_0:
             if use_kt_weight_path:
-                int8_weights = load_experts_from_kt_weight_path(
-                    kt_weight_path=kt_weight_path,
-                    layer_idx=layer_idx,
-                    num_experts=moe_config.expert_num,
-                    hidden_size=hidden_size,
-                    intermediate_size=moe_config.intermediate_size,
+                # Pre-quantized weights: skip loading here, the wrapper will load
+                # directly from kt_weight_path via _load_base_weights_from_file
+                logger.info(
+                    f"  Layer {layer_idx}: deferring weight loading to KTMoEWrapper "
+                    f"(kt_weight_path={kt_weight_path!r})"
                 )
-                gate_proj = int8_weights.gate_proj
-                up_proj = int8_weights.up_proj
-                down_proj = int8_weights.down_proj
             elif use_checkpoint_files:
                 layers_prefix = _get_layers_prefix(model.config)
                 gate_proj, up_proj, down_proj = load_experts_from_checkpoint_files(
@@ -2237,23 +2233,38 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                 num_gpu_experts=0,
                 cpuinfer_threads=getattr(kt_plugin, "kt_num_threads", 1),
                 threadpool_count=threadpool_count,
-                weight_path="",
+                weight_path=kt_weight_path or "",
                 chunked_prefill_size=chunked_prefill_size,
                 method=kt_method,
                 mode="sft",
                 lora_rank=wrapper_lora_rank,
                 lora_alpha=wrapper_lora_alpha,
-                max_cache_depth=8,
+                max_cache_depth=getattr(kt_plugin, "kt_max_cache_depth", 2),
             )
 
             physical_to_logical_map = torch.arange(moe_config.expert_num, dtype=torch.int64, device="cpu")
 
-            wrapper.load_weights_from_tensors(
-                gate_proj=gate_proj,
-                up_proj=up_proj,
-                down_proj=down_proj,
-                physical_to_logical_map_cpu=physical_to_logical_map,
-            )
+            if use_kt_weight_path:
+                # Pre-quantized weights: let the wrapper load directly from kt_weight_path
+                # (the wrapper's load_weights will call _load_base_weights_from_file)
+                print(
+                    f"[kt_moe] Layer {layer_idx}: calling wrapper.load_weights() "
+                    f"(pre-quantized path, kt_weight_path={kt_weight_path!r})",
+                    flush=True,
+                )
+                wrapper.load_weights(physical_to_logical_map)
+            else:
+                print(
+                    f"[kt_moe] Layer {layer_idx}: calling wrapper.load_weights_from_tensors() "
+                    f"(BF16 tensor path, gate_proj shape={gate_proj.shape if gate_proj is not None else None})",
+                    flush=True,
+                )
+                wrapper.load_weights_from_tensors(
+                    gate_proj=gate_proj,
+                    up_proj=up_proj,
+                    down_proj=down_proj,
+                    physical_to_logical_map_cpu=physical_to_logical_map,
+                )
 
             if lora_params is not None:
                 print(f"[init_lora_weights] Layer {layer_idx}: Calling init_lora_weights", flush=True)
