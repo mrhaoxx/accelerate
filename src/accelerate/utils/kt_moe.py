@@ -1366,11 +1366,12 @@ class KTMoEFunction(torch.autograd.Function):
                 if grad_tensor is None:
                     continue
                 grad_cloned = grad_tensor.clone().to(dtype=param.dtype, device=param.device)
-                # No world_size scaling needed. The gathered grad_output already carries
-                # the per-rank loss scaling (1/per_device_bs). FSDP-wrapped params see
-                # this same 1/per_device_bs gradient after reduce-scatter. Dividing by
-                # world_size here would halve KT LoRA gradient relative to FSDP-wrapped
-                # params, creating an inconsistent effective learning rate.
+                # KT backward runs on rank 0 with gathered data from all ranks,
+                # so the gradient is a sum over all ranks' contributions.
+                # FSDP-managed params get all-reduce averaged gradients (divided by world_size).
+                # Divide by world_size to keep MoE LoRA on the same scale as FSDP params.
+                if world_size > 1:
+                    grad_cloned /= world_size
                 if param.grad is None:
                     param.grad = grad_cloned
                 else:
