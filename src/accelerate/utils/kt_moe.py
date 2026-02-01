@@ -18,6 +18,7 @@ KTransformers MoE Backend Integration via KTMoEWrapper.
 
 from __future__ import annotations
 
+import gc
 import importlib.util as _u
 import math
 import os
@@ -1990,6 +1991,8 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
     use_checkpoint_files = bool(checkpoint_files) and not use_kt_weight_path
     if use_checkpoint_files:
         logger.info("Loading expert weights from checkpoint files (online conversion).")
+    elif use_kt_weight_path and bool(checkpoint_files):
+        logger.info("BF16 checkpoint files available for backward gradient computation.")
     elif (not use_kt_weight_path) and bool(getattr(kt_plugin, "kt_skip_expert_loading", False)):
         # If HF expert weights were skipped during `from_pretrained`, we must source expert weights externally.
         model_name_or_path = getattr(getattr(model, "config", None), "name_or_path", None)
@@ -2041,12 +2044,32 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
 
         if is_rank_0:
             if use_kt_weight_path:
-                # Pre-quantized weights: skip loading here, the wrapper will load
-                # directly from kt_weight_path via _load_base_weights_from_file
-                logger.info(
-                    f"  Layer {layer_idx}: deferring weight loading to KTMoEWrapper "
-                    f"(kt_weight_path={kt_weight_path!r})"
-                )
+                # Pre-quantized weights: the wrapper will load INT8 from kt_weight_path.
+                # BF16 weights must come from checkpoint files (model weights are empty/meta
+                # with cpu_ram_efficient_loading). C++ backward needs BF16 base weights to
+                # compute gate/up LoRA B gradients through the gated MLP chain.
+                if checkpoint_files:
+                    layers_prefix = _get_layers_prefix(model.config)
+                    logger.info(
+                        f"  Layer {layer_idx}: loading BF16 from checkpoint files for backward, "
+                        f"INT8 forward from kt_weight_path={kt_weight_path!r}"
+                    )
+                    gate_proj, up_proj, down_proj = load_experts_from_checkpoint_files(
+                        checkpoint_files=checkpoint_files,
+                        sharded_metadata=sharded_metadata,
+                        layers_prefix=layers_prefix,
+                        moe_config=moe_config,
+                        layer_idx=layer_idx,
+                    )
+                else:
+                    logger.warning(
+                        f"  Layer {layer_idx}: no checkpoint files available for BF16 backward weights! "
+                        f"Falling back to extract_moe_weights (may be empty with cpu_ram_efficient_loading)"
+                    )
+                    gate_proj, up_proj, down_proj = extract_moe_weights(moe_module, moe_config)
+                    gate_proj = gate_proj.cpu().to(torch.bfloat16).contiguous()
+                    up_proj = up_proj.cpu().to(torch.bfloat16).contiguous()
+                    down_proj = down_proj.cpu().to(torch.bfloat16).contiguous()
             elif use_checkpoint_files:
                 layers_prefix = _get_layers_prefix(model.config)
                 gate_proj, up_proj, down_proj = load_experts_from_checkpoint_files(
@@ -2245,8 +2268,11 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
             physical_to_logical_map = torch.arange(moe_config.expert_num, dtype=torch.int64, device="cpu")
 
             if use_kt_weight_path:
-                # Pre-quantized weights: let the wrapper load directly from kt_weight_path
-                # (the wrapper's load_weights will call _load_base_weights_from_file)
+                # Pre-quantized weights: let the wrapper load INT8 from kt_weight_path.
+                # Store BF16 weights separately for backward gradient computation.
+                wrapper._bf16_gate_proj = gate_proj
+                wrapper._bf16_up_proj = up_proj
+                wrapper._bf16_down_proj = down_proj
                 print(
                     f"[kt_moe] Layer {layer_idx}: calling wrapper.load_weights() "
                     f"(pre-quantized path, kt_weight_path={kt_weight_path!r})",
@@ -2267,13 +2293,6 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                 )
 
             if lora_params is not None:
-                print(f"[init_lora_weights] Layer {layer_idx}: Calling init_lora_weights", flush=True)
-                print(f"  wrapper dimensions: num_experts={wrapper.num_experts}, "
-                      f"lora_rank={wrapper.lora_rank}, hidden_size={wrapper.hidden_size}, "
-                      f"intermediate_size={wrapper.moe_intermediate_size}", flush=True)
-                for k, v in lora_params.items():
-                    print(f"  {k}: shape={v.shape}, dtype={v.dtype}, "
-                          f"device={v.device}, contiguous={v.data.is_contiguous()}", flush=True)
                 wrapper.init_lora_weights(
                     gate_lora_a=lora_params["gate_lora_a"].data,
                     gate_lora_b=lora_params["gate_lora_b"].data,
@@ -2282,7 +2301,6 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                     down_lora_a=lora_params["down_lora_a"].data,
                     down_lora_b=lora_params["down_lora_b"].data,
                 )
-                print(f"[init_lora_weights] Layer {layer_idx}: Done", flush=True)
 
         layer_wrapper = KTMoELayerWrapper(
             original_moe=moe_module,
@@ -2301,10 +2319,13 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
         wrappers.append(layer_wrapper)
         moe_layer_count += 1
 
-        # _clear_original_expert_weights(moe_module, moe_config)
+        # Free original expert weights — moe_module is no longer in the model tree.
+        # Rank 0 already copied weights to C++ kernel via load_weights_from_tensors.
+        _clear_original_expert_weights(moe_module, moe_config)
 
     mode_str = "LoRA Experts" if use_lora_experts else "per-expert LoRA"
     logger.info(f"Wrapped {moe_layer_count} MoE layers with KTMoEWrapper ({mode_str} mode)")
+    gc.collect()
     return wrappers
 
 
@@ -2392,7 +2413,7 @@ def load_kt_model(
 
     loading_kwargs.update(kwargs)
 
-    if getattr(kt_plugin, "kt_skip_expert_loading", None) is None and getattr(kt_plugin, "kt_weight_path", None) is None:
+    if getattr(kt_plugin, "kt_skip_expert_loading", None) is None:
         checkpoint_files, sharded_metadata = _resolve_checkpoint_files(
             model_name_or_path=model_name_or_path,
             cache_dir=cache_dir,
@@ -2401,7 +2422,12 @@ def load_kt_model(
             trust_remote_code=trust_remote_code,
         )
         if checkpoint_files and all(f.endswith(".safetensors") for f in checkpoint_files):
-            kt_plugin.kt_skip_expert_loading = True
+            if getattr(kt_plugin, "kt_weight_path", None) is None:
+                kt_plugin.kt_skip_expert_loading = True
+            else:
+                # kt_weight_path provides INT8 for forward, but we still need
+                # checkpoint files to load BF16 weights for backward pass.
+                kt_plugin.kt_skip_expert_loading = False
             kt_plugin.kt_checkpoint_files = checkpoint_files
             kt_plugin.kt_sharded_metadata = sharded_metadata
         else:
