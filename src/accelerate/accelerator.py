@@ -1670,36 +1670,16 @@ class Accelerator:
         if model_index is None:
             return tuple(result)
 
-        # Apply KT wrapping before FSDP2 wrapping if KT plugin is enabled
+        # Register KT wrappers as ignored_modules for FSDP2
+        # The entire KTMoELayerWrapper should be skipped by FSDP (expert weights live in C++ kernel,
+        # lora_params are managed separately, _original_experts are CPU placeholders)
         kt_plugin = getattr(self.state, "kt_config", None)
-        if kt_plugin is not None and kt_plugin.enabled and getattr(model, "_kt_wrappers", None) is None:
-            from .utils.kt_moe import wrap_moe_layers_with_kt_wrapper
-
-            if kt_plugin.wrap_fn is None:
-                wrappers = wrap_moe_layers_with_kt_wrapper(model, kt_plugin)
-            else:
-                wrap_kwargs = kt_plugin.wrap_kwargs or {}
-                wrappers = kt_plugin.wrap_fn(model, kt_plugin, **wrap_kwargs)
-
-            model._kt_wrappers = wrappers
-            model._kt_tp_enabled = bool(kt_plugin.kt_tp_enabled)
-            model._kt_use_lora_experts = bool(kt_plugin.kt_use_lora_experts)
-            moe_lora_params = {}
-            for wrapper in wrappers:
-                if getattr(wrapper, "lora_params", None) is not None:
-                    moe_lora_params[wrapper.layer_idx] = dict(wrapper.lora_params)
-            model._kt_moe_lora_params = moe_lora_params
-
-            # Only ignore the LoRA ParameterDict modules, NOT the whole wrapper.
-            # The wrapper also contains the router and shared_experts which MUST be
-            # sharded by FSDP2.  If we ignore the whole wrapper, model.to("meta")
-            # moves the router to meta, and fsdp2_load_full_state_dict can't
-            # broadcast meta tensors on non-rank-0 → crash.
+        if kt_plugin is not None and kt_plugin.enabled and getattr(model, "_kt_wrappers", None) is not None:
             if self.state.fsdp_plugin.ignored_modules is None:
                 self.state.fsdp_plugin.ignored_modules = []
-            for wrapper in wrappers:
-                if wrapper.lora_params is not None and wrapper.lora_params not in self.state.fsdp_plugin.ignored_modules:
-                    self.state.fsdp_plugin.ignored_modules.append(wrapper.lora_params)
+            for wrapper in model._kt_wrappers:
+                if wrapper not in self.state.fsdp_plugin.ignored_modules:
+                    self.state.fsdp_plugin.ignored_modules.append(wrapper)
 
         # Needs to be done first, to make sure AC + fully_shard will work as expected
         self.state.fsdp_plugin.set_auto_wrap_policy(model)
@@ -1832,24 +1812,6 @@ class Accelerator:
                 "You can't train a model that has been loaded with `device_map='auto'` in any distributed mode."
                 " Please rerun your script specifying `--num_processes=1` or by launching with `python {{myscript.py}}`."
             )
-
-        if kt_plugin is not None and kt_plugin.enabled and getattr(model, "_kt_wrappers", None) is None:
-            from .utils.kt_moe import wrap_moe_layers_with_kt_wrapper
-
-            if kt_plugin.wrap_fn is None:
-                wrappers = wrap_moe_layers_with_kt_wrapper(model, kt_plugin)
-            else:
-                wrap_kwargs = kt_plugin.wrap_kwargs or {}
-                wrappers = kt_plugin.wrap_fn(model, kt_plugin, **wrap_kwargs)
-
-            model._kt_wrappers = wrappers
-            model._kt_tp_enabled = bool(kt_plugin.kt_tp_enabled)
-            model._kt_use_lora_experts = bool(kt_plugin.kt_use_lora_experts)
-            moe_lora_params = {}
-            for wrapper in wrappers:
-                if getattr(wrapper, "lora_params", None) is not None:
-                    moe_lora_params[wrapper.layer_idx] = dict(wrapper.lora_params)
-            model._kt_moe_lora_params = moe_lora_params
 
         if self.native_amp:
             model._original_forward = model.forward

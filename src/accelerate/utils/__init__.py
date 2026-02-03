@@ -77,6 +77,7 @@ from .kt_moe import (
     get_expert_device,
     update_kt_lora_pointers,
     get_kt_lora_params,
+    kt_adapt_peft_lora,
     sync_kt_lora_gradients,
     load_kt_model,
     load_moe_lora_from_adapter,

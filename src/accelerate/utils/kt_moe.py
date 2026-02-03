@@ -522,10 +522,13 @@ def _clear_original_expert_weights(moe_module: nn.Module, moe_config: MOEArchCon
 
     with _maybe_zero3_gathered_parameters(gather_params):
         for proj, container, param_name, weight_param in _iter_weight_params():
-            original_device = weight_param.device
             original_dtype = weight_param.dtype
+            # Use empty CPU tensor with original shape. On Linux, torch.empty allocates
+            # virtual memory only (no RSS until pages are touched), so this is effectively
+            # free. PEFT can discover the module and infer in/out features from shape.
+            # Avoid meta device — it breaks FSDP2's .to(device) and other downstream ops.
             new_param = nn.Parameter(
-                torch.empty(0, device=original_device, dtype=original_dtype),
+                torch.empty(weight_param.shape, device="cpu", dtype=original_dtype),
                 requires_grad=False,
             )
 
@@ -573,23 +576,63 @@ def _get_peft_lora_weights(module: nn.Module) -> tuple[torch.Tensor, torch.Tenso
     lora_B = getattr(module, "lora_B", None)
 
     if lora_A is None or lora_B is None:
+        print(
+            f"[_get_peft_lora_weights] module={type(module).__name__}: "
+            f"lora_A={'found' if lora_A is not None else 'MISSING'}, "
+            f"lora_B={'found' if lora_B is not None else 'MISSING'}",
+            flush=True,
+        )
         return None
 
     # PEFT stores adapters in a ModuleDict, default adapter is "default"
     if isinstance(lora_A, nn.ModuleDict):
-        logger.info(f"[_get_peft_lora_weights] lora_A keys={list(lora_A.keys())}")
-        lora_A = lora_A["default"] if "default" in lora_A else None
-        lora_B = lora_B["default"] if "default" in lora_B else None
+        print(f"[_get_peft_lora_weights] lora_A is ModuleDict, keys={list(lora_A.keys())}", flush=True)
+        # Try to get the active adapter if not "default"
+        active_adapter = getattr(module, "active_adapter", ["default"])
+        if isinstance(active_adapter, (list, tuple)):
+            active_adapter = active_adapter[0] if active_adapter else "default"
+        if active_adapter in lora_A:
+            lora_A = lora_A[active_adapter]
+            lora_B = lora_B[active_adapter]
+        elif "default" in lora_A:
+            lora_A = lora_A["default"]
+            lora_B = lora_B["default"]
+        else:
+            lora_A = None
+            lora_B = None
 
     if lora_A is None or lora_B is None:
+        print(f"[_get_peft_lora_weights] adapter not found in ModuleDict", flush=True)
         return None
 
     # Get the weight tensors
     if hasattr(lora_A, "weight"):
-        logger.info(f"[_get_peft_lora_weights] lora_A.weight shape={lora_A.weight.shape}, lora_B.weight shape={lora_B.weight.shape}")
-        return lora_A.weight.data, lora_B.weight.data
+        w_a, w_b = lora_A.weight.data, lora_B.weight.data
+        print(
+            f"[_get_peft_lora_weights] module={type(module).__name__}: "
+            f"lora_A.weight shape={tuple(w_a.shape)} dtype={w_a.dtype} device={w_a.device} | "
+            f"lora_B.weight shape={tuple(w_b.shape)} dtype={w_b.dtype} device={w_b.device}",
+            flush=True,
+        )
+        return w_a, w_b
 
+    print(f"[_get_peft_lora_weights] module={type(module).__name__}: lora_A has no .weight attr", flush=True)
     return None
+
+
+def _debug_print_lora_modules(model: nn.Module, prefix: str = "") -> int:
+    """Debug helper: print all modules with lora_A attribute in the model."""
+    count = 0
+    for name, mod in model.named_modules():
+        if hasattr(mod, "lora_A"):
+            count += 1
+            if count <= 10:  # Print first 10 only
+                lora_A = mod.lora_A
+                keys = list(lora_A.keys()) if isinstance(lora_A, nn.ModuleDict) else "N/A"
+                print(f"[{prefix}] Found LoRA module: {name}, type={type(mod).__name__}, keys={keys}", flush=True)
+    if count > 10:
+        print(f"[{prefix}] ... and {count - 10} more LoRA modules", flush=True)
+    return count
 
 
 def extract_peft_lora_from_experts(
@@ -608,6 +651,11 @@ def extract_peft_lora_from_experts(
     Returns:
         Tuple of (lora_params dict, lora_rank) or (None, None) if no PEFT LoRA found.
     """
+    print(
+        f"[extract_peft_lora_from_experts] ENTER: num_experts={len(experts)}, "
+        f"weight_names={moe_config.weight_names}, dtype={dtype}",
+        flush=True,
+    )
     gate_name, up_name, down_name = moe_config.weight_names
     num_experts = len(experts)
 
@@ -643,32 +691,69 @@ def extract_peft_lora_from_experts(
         gate_proj = getattr(expert, gate_name)
         gate_lora = _get_peft_lora_weights(gate_proj)
         if gate_lora is not None:
-            gate_lora_a_list.append(gate_lora[0].to(dtype=dtype).cpu().contiguous())
-            gate_lora_b_list.append(gate_lora[1].to(dtype=dtype).cpu().contiguous())
+            a, b = gate_lora[0].to(dtype=dtype).cpu().contiguous(), gate_lora[1].to(dtype=dtype).cpu().contiguous()
+            gate_lora_a_list.append(a)
+            gate_lora_b_list.append(b)
+            if expert_idx == 0:
+                print(
+                    f"[extract_peft_lora] expert[0].{gate_name}: "
+                    f"lora_A shape={tuple(a.shape)} dtype={a.dtype} device={gate_lora[0].device} "
+                    f"norm={a.float().norm().item():.6e} mean={a.float().mean().item():.6e} | "
+                    f"lora_B shape={tuple(b.shape)} norm={b.float().norm().item():.6e} mean={b.float().mean().item():.6e}",
+                    flush=True,
+                )
         else:
             # Fallback: zero init
             gate_lora_a_list.append(torch.zeros(lora_rank, hidden_size, dtype=dtype))
             gate_lora_b_list.append(torch.zeros(intermediate_size, lora_rank, dtype=dtype))
+            if expert_idx == 0:
+                print(f"[extract_peft_lora] WARNING expert[0].{gate_name}: no PEFT LoRA found, using zeros", flush=True)
 
         # Up proj
         up_proj = getattr(expert, up_name)
         up_lora = _get_peft_lora_weights(up_proj)
         if up_lora is not None:
-            up_lora_a_list.append(up_lora[0].to(dtype=dtype).cpu().contiguous())
-            up_lora_b_list.append(up_lora[1].to(dtype=dtype).cpu().contiguous())
+            a, b = up_lora[0].to(dtype=dtype).cpu().contiguous(), up_lora[1].to(dtype=dtype).cpu().contiguous()
+            up_lora_a_list.append(a)
+            up_lora_b_list.append(b)
+            if expert_idx == 0:
+                print(
+                    f"[extract_peft_lora] expert[0].{up_name}: "
+                    f"lora_A shape={tuple(a.shape)} norm={a.float().norm().item():.6e} mean={a.float().mean().item():.6e} | "
+                    f"lora_B shape={tuple(b.shape)} norm={b.float().norm().item():.6e} mean={b.float().mean().item():.6e}",
+                    flush=True,
+                )
         else:
             up_lora_a_list.append(torch.zeros(lora_rank, hidden_size, dtype=dtype))
             up_lora_b_list.append(torch.zeros(intermediate_size, lora_rank, dtype=dtype))
+            if expert_idx == 0:
+                print(f"[extract_peft_lora] WARNING expert[0].{up_name}: no PEFT LoRA found, using zeros", flush=True)
 
         # Down proj
         down_proj = getattr(expert, down_name)
         down_lora = _get_peft_lora_weights(down_proj)
         if down_lora is not None:
-            down_lora_a_list.append(down_lora[0].to(dtype=dtype).cpu().contiguous())
-            down_lora_b_list.append(down_lora[1].to(dtype=dtype).cpu().contiguous())
+            a, b = down_lora[0].to(dtype=dtype).cpu().contiguous(), down_lora[1].to(dtype=dtype).cpu().contiguous()
+            down_lora_a_list.append(a)
+            down_lora_b_list.append(b)
+            if expert_idx == 0:
+                print(
+                    f"[extract_peft_lora] expert[0].{down_name}: "
+                    f"lora_A shape={tuple(a.shape)} norm={a.float().norm().item():.6e} mean={a.float().mean().item():.6e} | "
+                    f"lora_B shape={tuple(b.shape)} norm={b.float().norm().item():.6e} mean={b.float().mean().item():.6e}",
+                    flush=True,
+                )
         else:
             down_lora_a_list.append(torch.zeros(lora_rank, intermediate_size, dtype=dtype))
             down_lora_b_list.append(torch.zeros(hidden_size, lora_rank, dtype=dtype))
+            if expert_idx == 0:
+                print(f"[extract_peft_lora] WARNING expert[0].{down_name}: no PEFT LoRA found, using zeros", flush=True)
+
+    print(
+        f"[extract_peft_lora] Collected {num_experts} experts, "
+        f"gate_lora_a: {len(gate_lora_a_list)}, up_lora_a: {len(up_lora_a_list)}, down_lora_a: {len(down_lora_a_list)}",
+        flush=True,
+    )
 
     # Stack into [num_experts, ...] tensors and ensure bf16 + contiguous
     lora_params = {
@@ -680,15 +765,16 @@ def extract_peft_lora_from_experts(
         "down_lora_b": nn.Parameter(torch.stack(down_lora_b_list, dim=0).to(dtype=dtype).contiguous()),
     }
 
-    # Debug: print shapes
-    logger.info(f"[PEFT LoRA DEBUG] Extracted shapes:")
-    logger.info(f"  gate_lora_a: {lora_params['gate_lora_a'].shape}")
-    logger.info(f"  gate_lora_b: {lora_params['gate_lora_b'].shape}")
-    logger.info(f"  up_lora_a: {lora_params['up_lora_a'].shape}")
-    logger.info(f"  up_lora_b: {lora_params['up_lora_b'].shape}")
-    logger.info(f"  down_lora_a: {lora_params['down_lora_a'].shape}")
-    logger.info(f"  down_lora_b: {lora_params['down_lora_b'].shape}")
-    logger.info(f"  lora_rank={lora_rank}, hidden_size={hidden_size}, intermediate_size={intermediate_size}")
+    # Debug: print shapes and stats
+    print(f"[extract_peft_lora] Stacked lora_params (num_experts={num_experts}, rank={lora_rank}):", flush=True)
+    for name, param in lora_params.items():
+        pf = param.data.float()
+        print(
+            f"  {name}: shape={tuple(param.shape)} dtype={param.dtype} "
+            f"norm={pf.norm().item():.6e} mean={pf.mean().item():.6e} "
+            f"max={pf.max().item():.6e} min={pf.min().item():.6e}",
+            flush=True,
+        )
 
     logger.info(f"Extracted PEFT LoRA from {num_experts} experts (dtype={dtype})")
     return lora_params, lora_rank
@@ -761,37 +847,6 @@ def disable_peft_lora_on_experts(experts: nn.ModuleList, moe_config: MOEArchConf
 
     return disabled_count
 
-
-def create_lora_params(
-    expert_num: int,
-    hidden_size: int,
-    intermediate_size: int,
-    lora_rank: int,
-    lora_alpha: float,
-    device: str = "cpu",
-    dtype: torch.dtype = torch.bfloat16,
-) -> dict[str, nn.Parameter]:
-    """Create LoRA parameters for MoE layer (KT native initialization)."""
-    gate_lora_a = torch.zeros(expert_num, lora_rank, hidden_size, dtype=dtype, device=device)
-    gate_lora_b = torch.zeros(expert_num, intermediate_size, lora_rank, dtype=dtype, device=device)
-
-    up_lora_a = torch.zeros(expert_num, lora_rank, hidden_size, dtype=dtype, device=device)
-    up_lora_b = torch.zeros(expert_num, intermediate_size, lora_rank, dtype=dtype, device=device)
-
-    down_lora_a = torch.zeros(expert_num, lora_rank, intermediate_size, dtype=dtype, device=device)
-    down_lora_b = torch.zeros(expert_num, hidden_size, lora_rank, dtype=dtype, device=device)
-
-    for tensor in [gate_lora_a, up_lora_a, down_lora_a]:
-        nn.init.kaiming_uniform_(tensor, a=math.sqrt(5))
-
-    return {
-        "gate_lora_a": nn.Parameter(gate_lora_a),
-        "gate_lora_b": nn.Parameter(gate_lora_b),
-        "up_lora_a": nn.Parameter(up_lora_a),
-        "up_lora_b": nn.Parameter(up_lora_b),
-        "down_lora_a": nn.Parameter(down_lora_a),
-        "down_lora_b": nn.Parameter(down_lora_b),
-    }
 
 
 # =============================================================================
@@ -1265,6 +1320,12 @@ class KTMoEFunction(torch.autograd.Function):
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
 
+        # DEBUG: Print gradient info
+        import os
+        if os.environ.get("KT_DEBUG_GRAD"):
+            print(f"[KT_DEBUG_GRAD] backward: rank={rank}, world_size={world_size}, dist_on={dist_on}, "
+                  f"qlen={qlen}, grad_output.norm={grad_output.float().norm().item():.6f}", flush=True)
+
         if dist_on:
             # ---- Data-parallel gather/scatter backward ----
             # Both batch_size and seq_len may differ across ranks.
@@ -1360,6 +1421,8 @@ class KTMoEFunction(torch.autograd.Function):
         # LoRA gradients: only rank 0 needs them (only rank 0 has KT wrapper).
         # No broadcast needed — non-rank-0 optimizer skips params with grad=None.
         if ctx.train_lora and ctx.lora_params is not None and grad_loras is not None and rank == 0:
+            import os
+            debug_grad = os.environ.get("KT_DEBUG_GRAD")
             for key, param in ctx.lora_params.items():
                 if not param.requires_grad:
                     continue
@@ -1367,12 +1430,19 @@ class KTMoEFunction(torch.autograd.Function):
                 if grad_tensor is None:
                     continue
                 grad_cloned = grad_tensor.clone().to(dtype=param.dtype, device=param.device)
+                # DEBUG: Print before scaling
+                if debug_grad:
+                    print(f"[KT_DEBUG_GRAD] LoRA grad {key}: before_scale_norm={grad_cloned.float().norm().item():.6f}, "
+                          f"world_size={world_size}", flush=True)
                 # KT backward runs on rank 0 with gathered data from all ranks,
                 # so the gradient is a sum over all ranks' contributions.
                 # FSDP-managed params get all-reduce averaged gradients (divided by world_size).
                 # Divide by world_size to keep MoE LoRA on the same scale as FSDP params.
                 if world_size > 1:
                     grad_cloned /= world_size
+                # DEBUG: Print after scaling
+                if debug_grad:
+                    print(f"[KT_DEBUG_GRAD] LoRA grad {key}: after_scale_norm={grad_cloned.float().norm().item():.6f}", flush=True)
                 if param.grad is None:
                     param.grad = grad_cloned
                 else:
@@ -1408,6 +1478,28 @@ class KTMoELayerWrapper(nn.Module):
         self.layer_idx = layer_idx
         self.router_type = moe_config.router_type
 
+        # IMPORTANT: Register submodules in the SAME ORDER as original MoE module
+        # so that PEFT's named_modules() traversal order matches baseline.
+        # This ensures kaiming_uniform_ calls happen in the same sequence.
+        # Qwen3MoeSparseMoeBlock order: gate FIRST, then experts.
+
+        # 1. gate/router FIRST - keep original attribute name for PEFT compatibility
+        router_attr = moe_config.router_attr  # "gate" for Qwen3/DeepSeek
+        setattr(self, router_attr, getattr(original_moe, router_attr, None))
+        self._router_attr = router_attr
+
+        # 2. experts SECOND (this is what PEFT targets for LoRA)
+        experts_attr = moe_config.experts_attr  # typically "experts"
+        setattr(self, experts_attr, getattr(original_moe, experts_attr, None))
+        self._experts_attr = experts_attr
+
+        # 3. shared_experts (if any)
+        if moe_config.has_shared_experts and hasattr(original_moe, "shared_experts"):
+            self.shared_experts = original_moe.shared_experts
+        else:
+            self.shared_experts = None
+
+        # 4. KT-specific modules (registered AFTER original MoE structure)
         self.lora_experts = lora_experts
 
         if lora_experts is not None:
@@ -1416,13 +1508,6 @@ class KTMoELayerWrapper(nn.Module):
         else:
             self._dummy_lora_params = None
             self.lora_params = nn.ParameterDict(lora_params) if lora_params else None
-
-        self.router = getattr(original_moe, moe_config.router_attr)
-
-        if moe_config.has_shared_experts and hasattr(original_moe, "shared_experts"):
-            self.shared_experts = original_moe.shared_experts
-        else:
-            self.shared_experts = None
 
         self._lora_pointers_dirty = False  # Initially false because init_lora_weights was just called
         # Store original lora_params tensors separately to prevent _apply from touching them
@@ -1437,6 +1522,8 @@ class KTMoELayerWrapper(nn.Module):
         # lora_params is a ParameterDict (nn.Module subclass), so it's stored in _modules not _parameters
         saved_lora_params = None
         saved_dummy_lora_params = None
+        saved_experts = None
+        experts_attr = getattr(self, '_experts_attr', None)
 
         if self.lora_params is not None:
             # Remove from _modules to prevent recursion into ParameterDict
@@ -1448,6 +1535,10 @@ class KTMoELayerWrapper(nn.Module):
             saved_dummy_lora_params = self._dummy_lora_params
             self._parameters.pop('_dummy_lora_params', None)
 
+        if experts_attr is not None and getattr(self, experts_attr, None) is not None:
+            saved_experts = getattr(self, experts_attr)
+            self._modules.pop(experts_attr, None)
+
         result = super()._apply(fn, recurse)
 
         # Restore lora_params - tensor references are preserved, no pointer update needed
@@ -1457,6 +1548,9 @@ class KTMoELayerWrapper(nn.Module):
 
         if saved_dummy_lora_params is not None:
             self._dummy_lora_params = saved_dummy_lora_params
+
+        if saved_experts is not None:
+            self._modules[experts_attr] = saved_experts
 
         return result
 
@@ -1661,8 +1755,9 @@ class KTMoELayerWrapper(nn.Module):
         return moe_output
 
     def _compute_routing(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        router = getattr(self, self._router_attr)
         if self.router_type == "deepseek_gate":
-            router_output = self.router(hidden_states)
+            router_output = router(hidden_states)
             if len(router_output) == 2:
                 topk_ids, topk_weights = router_output
             else:
@@ -1671,7 +1766,7 @@ class KTMoELayerWrapper(nn.Module):
                 topk_weights = topk_weights.to(torch.bfloat16)
             return topk_ids, topk_weights
 
-        router_logits = self.router(hidden_states.view(-1, self.hidden_size))
+        router_logits = router(hidden_states.view(-1, self.hidden_size))
         routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
         topk_weights, topk_ids = torch.topk(routing_weights, self.moe_config.num_experts_per_tok, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -1937,7 +2032,8 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
     """
     Replace model's MoE layers with KTMoEWrapper-based wrappers.
 
-    Expects `kt_plugin` to provide KT settings and LoRA settings.
+    Loads expert weights into the C++ KT kernel. No LoRA initialization —
+    LoRA is handled by PEFT and later adapted via kt_adapt_peft_lora().
     Only rank 0 initializes KT kernel and loads weights.
     """
     import torch.distributed as dist
@@ -1955,12 +2051,9 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
     moe_config = get_moe_arch_config(model.config)
     hidden_size = model.config.hidden_size
 
-    lora_rank = getattr(kt_plugin, "lora_rank", None)
-    lora_alpha = getattr(kt_plugin, "lora_alpha", None)
-    # lora_rank/lora_alpha can be None if PEFT LoRA is already applied to experts
-    # We'll validate this later when we check for PEFT LoRA
-
-    use_lora_experts = getattr(kt_plugin, "kt_use_lora_experts", False)
+    # Read lora_rank/lora_alpha for C++ wrapper initialization (buffer allocation only)
+    lora_rank = getattr(kt_plugin, "lora_rank", 1) or 1
+    lora_alpha = getattr(kt_plugin, "lora_alpha", 1.0) or 1.0
 
     wrappers: list[KTMoELayerWrapper] = []
     moe_layer_count = 0
@@ -2012,19 +2105,6 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                 "files could be resolved for on-the-fly expert loading."
             )
 
-    if use_lora_experts:
-        if getattr(kt_plugin, "kt_lora_expert_num", None) is None or getattr(
-            kt_plugin, "kt_lora_expert_intermediate_size", None
-        ) is None:
-            raise KTAMXConfigError(
-                "KTPlugin requires kt_lora_expert_num and kt_lora_expert_intermediate_size when kt_use_lora_experts is True."
-            )
-        logger.info(
-            "Using LoRA Experts mode: "
-            f"{getattr(kt_plugin, 'kt_lora_expert_num', None)} experts, "
-            f"intermediate_size={getattr(kt_plugin, 'kt_lora_expert_intermediate_size', None)}"
-        )
-
     model_container, layers = _get_model_container_and_layers(model, purpose="wrapping")
 
     for layer_idx, layer in enumerate(layers):
@@ -2032,10 +2112,9 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
         if moe_module is None:
             continue
 
-        mode_str = "LoRA Experts" if use_lora_experts else "per-expert LoRA"
         logger.info(
             f"Wrapping MoE layer {layer_idx} with KTMoEWrapper "
-            f"(method={kt_method}, tp={threadpool_count}, mode={mode_str})"
+            f"(method={kt_method}, tp={threadpool_count})"
         )
 
         # Only rank 0 loads weights and initializes KT kernel
@@ -2044,10 +2123,6 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
 
         if is_rank_0:
             if use_kt_weight_path:
-                # Pre-quantized weights: the wrapper will load INT8 from kt_weight_path.
-                # BF16 weights must come from checkpoint files (model weights are empty/meta
-                # with cpu_ram_efficient_loading). C++ backward needs BF16 base weights to
-                # compute gate/up LoRA B gradients through the gated MLP chain.
                 if checkpoint_files:
                     layers_prefix = _get_layers_prefix(model.config)
                     logger.info(
@@ -2085,162 +2160,6 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                 up_proj = up_proj.cpu().to(torch.bfloat16).contiguous()
                 down_proj = down_proj.cpu().to(torch.bfloat16).contiguous()
 
-        use_skip_lora = "SkipLoRA" in kt_method
-
-        # Try to extract PEFT LoRA from experts first (only on first layer, share detection result)
-        peft_lora_params = None
-        peft_lora_rank = None
-        if layer_idx == 0 or not hasattr(kt_plugin, "_peft_lora_detected"):
-            experts = getattr(moe_module, moe_config.experts_attr, None)
-            if experts is not None and len(experts) > 0:
-                # Check first expert for PEFT LoRA
-                first_expert = experts[0]
-                gate_name = moe_config.weight_names[0]
-                first_gate_proj = getattr(first_expert, gate_name, None)
-
-                peft_lora_params, peft_lora_rank = extract_peft_lora_from_experts(
-                    experts, moe_config, dtype=torch.bfloat16
-                )
-                kt_plugin._peft_lora_detected = peft_lora_rank is not None
-                if peft_lora_rank is not None:
-                    kt_plugin._peft_lora_rank = peft_lora_rank
-                    logger.info(f"Layer {layer_idx}: Detected PEFT-initialized LoRA (rank={peft_lora_rank})")
-            if dist.is_initialized():
-                # Sync PEFT LoRA detection across ranks to keep KT behavior consistent.
-                detected_tensor = torch.tensor(
-                    [1 if getattr(kt_plugin, "_peft_lora_detected", False) else 0], dtype=torch.int32, device="cpu"
-                )
-                dist.broadcast(detected_tensor, src=0)
-                kt_plugin._peft_lora_detected = bool(detected_tensor.item())
-                if kt_plugin._peft_lora_detected:
-                    rank_tensor = torch.tensor(
-                        [getattr(kt_plugin, "_peft_lora_rank", 0)], dtype=torch.int32, device="cpu"
-                    )
-                    dist.broadcast(rank_tensor, src=0)
-                    kt_plugin._peft_lora_rank = int(rank_tensor.item())
-
-        # Use PEFT LoRA if detected, otherwise create KT native LoRA
-        use_peft_lora = getattr(kt_plugin, "_peft_lora_detected", False) and not use_skip_lora
-        if layer_idx == 0:
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            logger.info(
-                f"Rank {rank}: peft_lora_detected={getattr(kt_plugin, '_peft_lora_detected', False)}, "
-                f"use_peft_lora={use_peft_lora}"
-            )
-
-        if use_lora_experts:
-            lora_experts = LoRAExperts(
-                num_experts=getattr(kt_plugin, "kt_lora_expert_num", None),
-                hidden_size=hidden_size,
-                intermediate_size=getattr(kt_plugin, "kt_lora_expert_intermediate_size", None),
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-
-            if use_skip_lora:
-                dummy_lora_rank = 1
-                lora_params = create_lora_params(
-                    expert_num=moe_config.expert_num,
-                    hidden_size=hidden_size,
-                    intermediate_size=moe_config.intermediate_size,
-                    lora_rank=dummy_lora_rank,
-                    lora_alpha=1.0,
-                )
-                for param in lora_params.values():
-                    param.requires_grad = False
-                wrapper_lora_rank = dummy_lora_rank
-                wrapper_lora_alpha = 1.0
-                logger.info(
-                    f"  Layer {layer_idx}: LoRA Experts + SkipLoRA mode (per-expert LoRA frozen)"
-                )
-            else:
-                # LoRA Experts mode with per-expert LoRA - requires lora_rank and lora_alpha
-                if lora_rank is None or lora_alpha is None:
-                    raise KTAMXConfigError(
-                        "KTPlugin requires lora_rank and lora_alpha for LoRA Experts + LoRA mode."
-                    )
-                lora_params = create_lora_params(
-                    expert_num=moe_config.expert_num,
-                    hidden_size=hidden_size,
-                    intermediate_size=moe_config.intermediate_size,
-                    lora_rank=lora_rank,
-                    lora_alpha=lora_alpha,
-                )
-                wrapper_lora_rank = lora_rank
-                wrapper_lora_alpha = lora_alpha
-                logger.info(f"  Layer {layer_idx}: LoRA Experts + LoRA mode (both trained)")
-        else:
-            lora_experts = None
-
-            if use_skip_lora:
-                dummy_lora_rank = 1
-                lora_params = create_lora_params(
-                    expert_num=moe_config.expert_num,
-                    hidden_size=hidden_size,
-                    intermediate_size=moe_config.intermediate_size,
-                    lora_rank=dummy_lora_rank,
-                    lora_alpha=1.0,
-                )
-                for param in lora_params.values():
-                    param.requires_grad = False
-                wrapper_lora_rank = dummy_lora_rank
-                wrapper_lora_alpha = 1.0
-                logger.info(f"  Layer {layer_idx}: SkipLoRA mode (MoE frozen)")
-            elif use_peft_lora:
-                # Extract PEFT LoRA for this layer
-                experts = getattr(moe_module, moe_config.experts_attr, None)
-                lora_params, extracted_rank = extract_peft_lora_from_experts(
-                    experts, moe_config, dtype=torch.bfloat16
-                )
-                if lora_params is None:
-                    # Fallback if extraction fails for this layer
-                    lora_params = create_lora_params(
-                        expert_num=moe_config.expert_num,
-                        hidden_size=hidden_size,
-                        intermediate_size=moe_config.intermediate_size,
-                        lora_rank=lora_rank,
-                        lora_alpha=lora_alpha,
-                    )
-                    wrapper_lora_rank = lora_rank
-                    wrapper_lora_alpha = lora_alpha
-                else:
-                    wrapper_lora_rank = extracted_rank
-                    # Use lora_alpha from config, or default to lora_rank (common PEFT default)
-                    wrapper_lora_alpha = lora_alpha if lora_alpha is not None else float(extracted_rank)
-                    # Disable original PEFT LoRA params to prevent double training
-                    disabled_count = disable_peft_lora_on_experts(experts, moe_config)
-                    rank = dist.get_rank() if dist.is_initialized() else 0
-                    logger.info(
-                        f"\033[35mRank {rank}: disabled PEFT LoRA params={disabled_count}\033[0m"
-                    )
-
-                    # Debug: print extracted lora_params shapes
-                    print(f"[PEFT LoRA] Layer {layer_idx}: Extracted lora_params shapes:", flush=True)
-                    for k, v in lora_params.items():
-                        print(f"  {k}: {v.shape}, dtype={v.dtype}", flush=True)
-                    print(f"  moe_config: expert_num={moe_config.expert_num}, "
-                          f"intermediate_size={moe_config.intermediate_size}", flush=True)
-                    print(f"  model hidden_size={hidden_size}", flush=True)
-
-                logger.info(f"  Layer {layer_idx}: PEFT LoRA mode (rank={wrapper_lora_rank}, alpha={wrapper_lora_alpha})")
-            else:
-                # KT native LoRA mode - requires lora_rank and lora_alpha
-                if lora_rank is None or lora_alpha is None:
-                    raise KTAMXConfigError(
-                        "KTPlugin requires lora_rank and lora_alpha when PEFT LoRA is not applied to experts. "
-                        "Either configure lora_rank/lora_alpha in kt_config, or apply PEFT LoRA to expert modules first."
-                    )
-                lora_params = create_lora_params(
-                    expert_num=moe_config.expert_num,
-                    hidden_size=hidden_size,
-                    intermediate_size=moe_config.intermediate_size,
-                    lora_rank=lora_rank,
-                    lora_alpha=lora_alpha,
-                )
-                wrapper_lora_rank = lora_rank
-                wrapper_lora_alpha = lora_alpha
-                logger.info(f"  Layer {layer_idx}: KT native LoRA mode (rank={lora_rank})")
-
         chunked_prefill_size = getattr(kt_plugin, "model_max_length", None)
         if chunked_prefill_size is None:
             chunked_prefill_size = getattr(model.config, "max_position_embeddings", 4096)
@@ -2260,16 +2179,14 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                 chunked_prefill_size=chunked_prefill_size,
                 method=kt_method,
                 mode="sft",
-                lora_rank=wrapper_lora_rank,
-                lora_alpha=wrapper_lora_alpha,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
                 max_cache_depth=getattr(kt_plugin, "kt_max_cache_depth", 2),
             )
 
             physical_to_logical_map = torch.arange(moe_config.expert_num, dtype=torch.int64, device="cpu")
 
             if use_kt_weight_path:
-                # Pre-quantized weights: let the wrapper load INT8 from kt_weight_path.
-                # Store BF16 weights separately for backward gradient computation.
                 wrapper._bf16_gate_proj = gate_proj
                 wrapper._bf16_up_proj = up_proj
                 wrapper._bf16_down_proj = down_proj
@@ -2279,6 +2196,9 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                     flush=True,
                 )
                 wrapper.load_weights(physical_to_logical_map)
+                wrapper._bf16_gate_proj = None
+                wrapper._bf16_up_proj = None
+                wrapper._bf16_down_proj = None
             else:
                 print(
                     f"[kt_moe] Layer {layer_idx}: calling wrapper.load_weights_from_tensors() "
@@ -2292,39 +2212,42 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                     physical_to_logical_map_cpu=physical_to_logical_map,
                 )
 
-            if lora_params is not None:
-                wrapper.init_lora_weights(
-                    gate_lora_a=lora_params["gate_lora_a"].data,
-                    gate_lora_b=lora_params["gate_lora_b"].data,
-                    up_lora_a=lora_params["up_lora_a"].data,
-                    up_lora_b=lora_params["up_lora_b"].data,
-                    down_lora_a=lora_params["down_lora_a"].data,
-                    down_lora_b=lora_params["down_lora_b"].data,
-                )
+            wrapper.gate_proj = None
+            wrapper.up_proj = None
+            wrapper.down_proj = None
+
+        if is_rank_0:
+            print(
+                f"[kt_moe INIT] Layer {layer_idx}: C++ wrapper created with "
+                f"lora_rank={lora_rank}, lora_alpha={lora_alpha}, "
+                f"num_experts={moe_config.expert_num}, hidden_size={hidden_size}, "
+                f"intermediate_size={moe_config.intermediate_size}",
+                flush=True,
+            )
 
         layer_wrapper = KTMoELayerWrapper(
             original_moe=moe_module,
             wrapper=wrapper,
-            lora_params=lora_params,
+            lora_params=None,
             moe_config=moe_config,
             hidden_size=hidden_size,
             layer_idx=layer_idx,
-            lora_experts=lora_experts,
         )
 
         setattr(layer, moe_config.moe_layer_attr, layer_wrapper)
-        if is_rank_0:
-            layer_wrapper._base_weights = (gate_proj, up_proj, down_proj)
+        # Base weights have been copied into the C++ kernel's internal BufferB format.
+        # Do not hold a Python-side reference — it wastes ~1 GB/layer.
+        del gate_proj, up_proj, down_proj
 
         wrappers.append(layer_wrapper)
         moe_layer_count += 1
 
-        # Free original expert weights — moe_module is no longer in the model tree.
+        # Replace original expert weights with meta placeholders.
+        # Experts remain in the model tree (via wrapper.experts) so PEFT can discover them.
         # Rank 0 already copied weights to C++ kernel via load_weights_from_tensors.
         _clear_original_expert_weights(moe_module, moe_config)
 
-    mode_str = "LoRA Experts" if use_lora_experts else "per-expert LoRA"
-    logger.info(f"Wrapped {moe_layer_count} MoE layers with KTMoEWrapper ({mode_str} mode)")
+    logger.info(f"Wrapped {moe_layer_count} MoE layers with KTMoEWrapper")
     gc.collect()
     return wrappers
 
@@ -2483,6 +2406,322 @@ def get_kt_lora_params(model: nn.Module) -> list[nn.Parameter]:
                 params.extend(wrapper.lora_experts.parameters())
 
     return params
+
+
+def kt_adapt_peft_lora(model: nn.Module) -> None:
+    """
+    Auto-adapt PEFT LoRA injected on expert modules into KT kernel.
+
+    After PEFT injects LoRA adapters onto expert Linear modules (which have meta weights),
+    this function:
+    1. Detects PEFT LoRA presence and rank on each wrapper's experts
+    2. Creates fresh KT LoRA params (PEFT LoRA on meta can't be extracted)
+    3. Disables original PEFT LoRA on experts (to avoid double computation)
+    4. Syncs new LoRA weights to the C++ KT kernel via init_lora_weights (rank 0 only)
+    5. Stores LoRA params on the wrapper for optimizer inclusion (all ranks)
+
+    Should be called after PEFT LoRA injection and before create_optimizer.
+    """
+    import torch.distributed as dist
+
+    wrappers = getattr(model, "_kt_wrappers", None)
+    if wrappers is None:
+        # Try unwrapping PEFT/other wrappers
+        base = model
+        for attr in ("base_model", "model"):
+            if hasattr(base, attr):
+                base = getattr(base, attr)
+                wrappers = getattr(base, "_kt_wrappers", None)
+                if wrappers:
+                    break
+
+    if not wrappers:
+        logger.info("[kt_adapt_peft_lora] No _kt_wrappers found, skipping")
+        return
+
+    is_rank_0 = True
+    if dist.is_initialized():
+        is_rank_0 = dist.get_rank() == 0
+
+    # Debug: print all LoRA modules in the model to verify PEFT injection
+    if is_rank_0:
+        lora_count = _debug_print_lora_modules(model, "kt_adapt_peft_lora")
+        print(f"[kt_adapt_peft_lora] Total LoRA modules in model: {lora_count}", flush=True)
+
+    adapted_count = 0
+    moe_lora_params = {}
+
+    # Detect PEFT LoRA rank and lora_alpha from first wrapper's experts (rank 0 only, then broadcast)
+    detected_lora_rank = 0
+    detected_lora_alpha = 0.0
+    first_wrapper = wrappers[0] if wrappers else None
+    if first_wrapper is not None:
+        experts_attr = getattr(first_wrapper, "_experts_attr", "experts")
+        experts = getattr(first_wrapper, experts_attr, None)
+
+        # Debug: Check if experts is properly registered in wrapper's _modules
+        if is_rank_0:
+            wrapper_modules = list(first_wrapper._modules.keys())
+            experts_registered = experts_attr in wrapper_modules
+            print(
+                f"[kt_adapt_peft_lora] Wrapper _modules: {wrapper_modules}, "
+                f"experts_attr='{experts_attr}', registered={experts_registered}",
+                flush=True,
+            )
+
+        print(
+            f"[kt_adapt_peft_lora] Checking {experts_attr}: "
+            f"wrapper={type(first_wrapper).__name__}, "
+            f"experts={type(experts).__name__ if experts is not None else 'None'}, "
+            f"len={len(experts) if experts is not None else 0}",
+            flush=True,
+        )
+
+        # Debug: Check if wrapper.experts is the same object as model...experts
+        if is_rank_0 and experts is not None:
+            for name, mod in model.named_modules():
+                if isinstance(mod, nn.ModuleList) and name.endswith(".experts"):
+                    is_same = mod is experts
+                    print(
+                        f"[kt_adapt_peft_lora] Comparing with model path '{name}': "
+                        f"same_object={is_same}, model_len={len(mod)}",
+                        flush=True,
+                    )
+                    if is_same:
+                        break
+        if experts is not None and len(experts) > 0:
+            moe_config = first_wrapper.moe_config
+            gate_name = moe_config.weight_names[0]
+            first_expert = experts[0]
+
+            # Debug: Check if expert modules are in the model's module tree
+            if is_rank_0:
+                expert_in_tree = False
+                expert_path = None
+                for name, mod in model.named_modules():
+                    if mod is first_expert:
+                        expert_in_tree = True
+                        expert_path = name
+                        break
+                print(
+                    f"[kt_adapt_peft_lora] first_expert in model tree: {expert_in_tree}, path={expert_path}",
+                    flush=True,
+                )
+                # Also check first_expert's submodules
+                expert_submodules = list(first_expert.named_children())
+                print(
+                    f"[kt_adapt_peft_lora] first_expert submodules: {[n for n, _ in expert_submodules]}",
+                    flush=True,
+                )
+
+            first_gate = getattr(first_expert, gate_name, None)
+            print(
+                f"[kt_adapt_peft_lora] first_expert type={type(first_expert).__name__}, "
+                f"first_gate ({gate_name}) type={type(first_gate).__name__ if first_gate is not None else 'None'}, "
+                f"has lora_A={hasattr(first_gate, 'lora_A') if first_gate else False}",
+                flush=True,
+            )
+            # Enhanced debug: print all attributes on first_gate to diagnose PEFT structure
+            if first_gate is not None:
+                gate_attrs = [a for a in dir(first_gate) if not a.startswith('_')]
+                lora_related = [a for a in gate_attrs if 'lora' in a.lower()]
+                print(
+                    f"[kt_adapt_peft_lora] first_gate attributes: lora_related={lora_related}, "
+                    f"all_submodules={list(first_gate._modules.keys()) if hasattr(first_gate, '_modules') else 'N/A'}",
+                    flush=True,
+                )
+                # Check if PEFT is using a different adapter structure
+                if hasattr(first_gate, 'base_layer'):
+                    print(
+                        f"[kt_adapt_peft_lora] first_gate has base_layer: {type(first_gate.base_layer).__name__}",
+                        flush=True,
+                    )
+                if hasattr(first_gate, 'active_adapter'):
+                    print(
+                        f"[kt_adapt_peft_lora] first_gate active_adapter: {first_gate.active_adapter}",
+                        flush=True,
+                    )
+            if first_gate is not None:
+                peft_lora = _get_peft_lora_weights(first_gate)
+                if peft_lora is not None:
+                    # lora_A shape: [rank, in_features]
+                    detected_lora_rank = peft_lora[0].shape[0]
+                    # Read lora_alpha from PEFT module
+                    peft_alpha_dict = getattr(first_gate, "lora_alpha", None)
+                    if isinstance(peft_alpha_dict, dict):
+                        detected_lora_alpha = float(peft_alpha_dict.get("default", detected_lora_rank))
+                    else:
+                        detected_lora_alpha = float(detected_lora_rank)
+                else:
+                    print(
+                        f"[kt_adapt_peft_lora] WARNING: _get_peft_lora_weights returned None for {gate_name}",
+                        flush=True,
+                    )
+
+    # Broadcast detection across ranks
+    if dist.is_initialized():
+        info_tensor = torch.tensor([detected_lora_rank, detected_lora_alpha], dtype=torch.float32, device="cpu")
+        dist.broadcast(info_tensor, src=0)
+        detected_lora_rank = int(info_tensor[0].item())
+        detected_lora_alpha = float(info_tensor[1].item())
+
+    if detected_lora_rank == 0:
+        logger.info("[kt_adapt_peft_lora] No PEFT LoRA detected on experts, skipping")
+        return
+
+    logger.info(f"[kt_adapt_peft_lora] Detected PEFT LoRA rank={detected_lora_rank}, lora_alpha={detected_lora_alpha}")
+    print(
+        f"[kt_adapt_peft_lora] Detected PEFT LoRA: rank={detected_lora_rank}, lora_alpha={detected_lora_alpha}",
+        flush=True,
+    )
+
+    for wrapper in wrappers:
+        moe_config = wrapper.moe_config
+        layer_idx = wrapper.layer_idx
+        hidden_size = wrapper.hidden_size
+
+        # Extract PEFT LoRA weights on rank 0, then broadcast to all ranks
+        lora_alpha = detected_lora_alpha
+        lora_params = None
+        experts_attr = getattr(wrapper, "_experts_attr", "experts")
+
+        if is_rank_0:
+            experts = getattr(wrapper, experts_attr, None)
+            if experts is not None:
+                lora_params, _ = extract_peft_lora_from_experts(
+                    experts, moe_config, dtype=torch.bfloat16,
+                )
+            if lora_params is None:
+                raise RuntimeError(
+                    f"[kt_adapt_peft_lora] Layer {layer_idx}: PEFT LoRA detected (rank={detected_lora_rank}) "
+                    f"but failed to extract weights from {experts_attr}. "
+                    f"Make sure get_peft_model() was called before kt_adapt_peft_lora()."
+                )
+            print(f"[kt_adapt] Layer {layer_idx}: extracted PEFT LoRA weights", flush=True)
+
+            # Verify extraction: compare KT extracted values with PEFT original values
+            if layer_idx == wrappers[0].layer_idx:  # Only verify first layer to reduce log spam
+                gate_name = moe_config.weight_names[0]
+                for expert_idx in range(min(3, len(experts))):  # Check first 3 experts
+                    peft_gate = getattr(experts[expert_idx], gate_name, None)
+                    if peft_gate is not None:
+                        peft_lora = _get_peft_lora_weights(peft_gate)
+                        if peft_lora is not None:
+                            peft_a = peft_lora[0].to(torch.bfloat16)
+                            kt_a = lora_params["gate_lora_a"][expert_idx]
+                            diff = (peft_a - kt_a).abs().max().item()
+                            cos = torch.nn.functional.cosine_similarity(
+                                peft_a.flatten().float(), kt_a.flatten().float(), dim=0
+                            ).item()
+                            print(
+                                f"[kt_adapt VERIFY] Layer {layer_idx} expert {expert_idx} gate_lora_a: "
+                                f"peft_norm={peft_a.float().norm().item():.6e} "
+                                f"kt_norm={kt_a.float().norm().item():.6e} "
+                                f"abs_max_diff={diff:.6e} cos={cos:.6f}",
+                                flush=True,
+                            )
+
+        # Broadcast extracted params from rank 0 to all ranks
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            if not is_rank_0:
+                # Allocate empty tensors with correct shapes on non-rank-0
+                lora_params = {
+                    "gate_lora_a": nn.Parameter(torch.empty(moe_config.expert_num, detected_lora_rank, hidden_size, dtype=torch.bfloat16)),
+                    "gate_lora_b": nn.Parameter(torch.zeros(moe_config.expert_num, moe_config.intermediate_size, detected_lora_rank, dtype=torch.bfloat16)),
+                    "up_lora_a": nn.Parameter(torch.empty(moe_config.expert_num, detected_lora_rank, hidden_size, dtype=torch.bfloat16)),
+                    "up_lora_b": nn.Parameter(torch.zeros(moe_config.expert_num, moe_config.intermediate_size, detected_lora_rank, dtype=torch.bfloat16)),
+                    "down_lora_a": nn.Parameter(torch.empty(moe_config.expert_num, detected_lora_rank, moe_config.intermediate_size, dtype=torch.bfloat16)),
+                    "down_lora_b": nn.Parameter(torch.zeros(moe_config.expert_num, hidden_size, detected_lora_rank, dtype=torch.bfloat16)),
+                }
+            for key in ("gate_lora_a", "gate_lora_b", "up_lora_a", "up_lora_b", "down_lora_a", "down_lora_b"):
+                dist.broadcast(lora_params[key].data, src=0)
+
+        # Log created lora_params stats
+        for name, param in lora_params.items():
+            pf = param.data.float()
+            print(
+                f"[kt_adapt INIT] Layer {layer_idx} {name}: shape={tuple(param.shape)} "
+                f"mean={pf.mean().item():.6e} max={pf.max().item():.6e} "
+                f"min={pf.min().item():.6e} norm={pf.norm().item():.6e} "
+                f"requires_grad={param.requires_grad} device={param.device}",
+                flush=True,
+            )
+
+        # Disable original PEFT LoRA on experts to avoid double computation
+        experts = getattr(wrapper, experts_attr, None)
+        if experts is not None:
+            disabled = disable_peft_lora_on_experts(experts, moe_config)
+            logger.info(
+                f"[kt_adapt_peft_lora] Layer {layer_idx}: created KT LoRA rank={detected_lora_rank}, "
+                f"disabled {disabled} original PEFT LoRA params"
+            )
+
+        # Set lora_params on wrapper (all ranks need this for optimizer)
+        wrapper.lora_params = nn.ParameterDict(lora_params)
+
+        # Verify C++ wrapper lora_alpha matches PEFT's
+        if wrapper.wrapper is not None:
+            cpp_alpha = getattr(wrapper.wrapper, "lora_alpha", None)
+            print(
+                f"[kt_adapt] Layer {layer_idx}: C++ wrapper lora_alpha={cpp_alpha}, "
+                f"PEFT lora_alpha={lora_alpha}, match={abs(float(cpp_alpha or 0) - lora_alpha) < 1e-6}",
+                flush=True,
+            )
+            if cpp_alpha is not None and abs(float(cpp_alpha) - lora_alpha) > 1e-6:
+                logger.warning(
+                    f"[kt_adapt] Layer {layer_idx}: C++ wrapper lora_alpha={cpp_alpha} != "
+                    f"PEFT lora_alpha={lora_alpha}! Scaling will be wrong."
+                )
+
+        # Sync to C++ kernel on rank 0 only
+        if is_rank_0 and wrapper.wrapper is not None:
+            wrapper.wrapper.init_lora_weights(
+                gate_lora_a=lora_params["gate_lora_a"].data,
+                gate_lora_b=lora_params["gate_lora_b"].data,
+                up_lora_a=lora_params["up_lora_a"].data,
+                up_lora_b=lora_params["up_lora_b"].data,
+                down_lora_a=lora_params["down_lora_a"].data,
+                down_lora_b=lora_params["down_lora_b"].data,
+            )
+            print(
+                f"[kt_adapt SYNC] Layer {layer_idx}: synced lora_params to C++ kernel "
+                f"(rank 0, wrapper id={id(wrapper.wrapper)})",
+                flush=True,
+            )
+        elif not is_rank_0:
+            print(
+                f"[kt_adapt SYNC] Layer {layer_idx}: skipped C++ sync (not rank 0), "
+                f"wrapper={'exists' if wrapper.wrapper is not None else 'None'}",
+                flush=True,
+            )
+
+        # Verify wrapper.lora_params is set and visible
+        print(
+            f"[kt_adapt SET] Layer {layer_idx}: wrapper.lora_params set, "
+            f"id(wrapper)={id(wrapper)}, "
+            f"num_params={len(wrapper.lora_params)}, "
+            f"param_ids={[id(p) for p in wrapper.lora_params.values()]}",
+            flush=True,
+        )
+
+        moe_lora_params[layer_idx] = dict(wrapper.lora_params)
+        adapted_count += 1
+
+    # Store on model for optimizer and FSDP2 to find
+    model._kt_moe_lora_params = moe_lora_params
+    logger.info(f"[kt_adapt_peft_lora] Adapted {adapted_count} layers")
+
+    # Final summary: verify params are discoverable via named_parameters
+    found_kt_params = 0
+    for name, p in model.named_parameters():
+        if "lora_params" in name and p.requires_grad:
+            found_kt_params += 1
+    total_kt_params = adapted_count * 6  # 6 lora tensors per layer
+    print(
+        f"[kt_adapt VERIFY] {found_kt_params}/{total_kt_params} KT LoRA params "
+        f"discoverable via model.named_parameters()",
+        flush=True,
+    )
 
 
 def update_kt_lora_pointers(model: nn.Module):
