@@ -80,10 +80,8 @@ from .kt_moe import (
     kt_adapt_peft_lora,
     sync_kt_lora_gradients,
     load_kt_model,
-    load_moe_lora_from_adapter,
     load_kt_moe_from_adapter,
     load_lora_experts_from_adapter,
-    save_moe_lora_to_adapter,
     save_lora_experts_to_adapter,
     save_kt_moe_to_adapter,
 )
