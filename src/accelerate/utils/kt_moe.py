@@ -1601,15 +1601,8 @@ class KTMoELayerWrapper(nn.Module):
             logger.warning(f"Layer {self.layer_idx}: Skipping update_lora_pointers - LoRA not initialized")
             return
 
-        # Sync PEFT LoRA weights to C++ kernel
-        if self._peft_lora_modules is not None and len(self._peft_lora_modules) > 0:
-            lora_tensors = _collect_peft_lora_tensors(self._peft_lora_modules, self.moe_config, torch.bfloat16)
-            # Copy to wrapper's internal tensors
-            for key, tensor in lora_tensors.items():
-                wrapper_attr = getattr(self.wrapper, key, None)
-                if wrapper_attr is not None:
-                    wrapper_attr.copy_(tensor)
-
+        # PEFT weights are views into wrapper's contiguous buffers —
+        # optimizer.step() already updated them in-place, just re-sync to C++.
         self.wrapper.update_lora_weights()
 
         if KT_DEBUG:
@@ -2102,19 +2095,16 @@ def kt_adapt_peft_lora(model: nn.Module) -> None:
         # Store PEFT LoRA references on wrapper
         wrapper._peft_lora_modules = peft_lora_modules
 
-        # Sync initial PEFT LoRA weights to C++ kernel (rank 0 only)
+        # Allocate contiguous bf16 buffers and populate with initial PEFT values (all ranks)
+        lora_buffers = _create_lora_view_buffers(peft_lora_modules, moe_config, torch.bfloat16)
+
+        # Rank 0: pass buffers to C++ wrapper (init_lora_weights stores them via .contiguous() no-op)
         if is_rank_0 and wrapper.wrapper is not None:
-            # Extract current PEFT LoRA values and sync to C++ kernel
-            lora_tensors = _collect_peft_lora_tensors(peft_lora_modules, moe_config, torch.bfloat16)
-            wrapper.wrapper.init_lora_weights(
-                gate_lora_a=lora_tensors["gate_lora_a"],
-                gate_lora_b=lora_tensors["gate_lora_b"],
-                up_lora_a=lora_tensors["up_lora_a"],
-                up_lora_b=lora_tensors["up_lora_b"],
-                down_lora_a=lora_tensors["down_lora_a"],
-                down_lora_b=lora_tensors["down_lora_b"],
-            )
+            wrapper.wrapper.init_lora_weights(**lora_buffers)
             logger.info(f"[kt_adapt_peft_lora] Layer {layer_idx}: synced PEFT LoRA to C++ kernel")
+
+        # All ranks: replace PEFT weights with views into the contiguous buffers
+        _replace_peft_weights_with_views(peft_lora_modules, lora_buffers, moe_config)
 
         adapted_count += 1
 
@@ -2246,6 +2236,86 @@ def _collect_peft_lora_tensors(
         "down_lora_a": torch.stack(down_lora_a_list, dim=0).contiguous(),
         "down_lora_b": torch.stack(down_lora_b_list, dim=0).contiguous(),
     }
+
+
+def _create_lora_view_buffers(
+    peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]],
+    moe_config: MOEArchConfig,
+    dtype: torch.dtype = torch.bfloat16,
+) -> dict[str, torch.Tensor]:
+    """
+    Allocate contiguous buffers and populate with initial PEFT LoRA values.
+
+    Returns dict with gate_lora_a, gate_lora_b, up_lora_a, up_lora_b,
+    down_lora_a, down_lora_b — each shape [num_experts, ...].
+    """
+    gate_name, up_name, down_name = moe_config.weight_names
+    num_experts = moe_config.expert_num
+
+    first_expert_loras = peft_lora_modules.get(0, {})
+    if not first_expert_loras:
+        raise RuntimeError("No PEFT LoRA found on expert 0")
+    gate_lora = first_expert_loras.get(gate_name)
+    if gate_lora is None:
+        raise RuntimeError(f"No PEFT LoRA found on expert 0 {gate_name}")
+
+    lora_rank = gate_lora[0].weight.shape[0]
+    hidden_size = gate_lora[0].weight.shape[1]
+    intermediate_size = gate_lora[1].weight.shape[0]
+
+    buffers = {
+        "gate_lora_a": torch.zeros(num_experts, lora_rank, hidden_size, dtype=dtype, device="cpu"),
+        "gate_lora_b": torch.zeros(num_experts, intermediate_size, lora_rank, dtype=dtype, device="cpu"),
+        "up_lora_a": torch.zeros(num_experts, lora_rank, hidden_size, dtype=dtype, device="cpu"),
+        "up_lora_b": torch.zeros(num_experts, intermediate_size, lora_rank, dtype=dtype, device="cpu"),
+        "down_lora_a": torch.zeros(num_experts, lora_rank, intermediate_size, dtype=dtype, device="cpu"),
+        "down_lora_b": torch.zeros(num_experts, hidden_size, lora_rank, dtype=dtype, device="cpu"),
+    }
+
+    proj_to_keys = {
+        gate_name: ("gate_lora_a", "gate_lora_b"),
+        up_name: ("up_lora_a", "up_lora_b"),
+        down_name: ("down_lora_a", "down_lora_b"),
+    }
+    for expert_idx in range(num_experts):
+        expert_loras = peft_lora_modules.get(expert_idx, {})
+        for proj_name, (key_a, key_b) in proj_to_keys.items():
+            if proj_name in expert_loras:
+                lora_A, lora_B = expert_loras[proj_name]
+                buffers[key_a][expert_idx].copy_(lora_A.weight.data.to(dtype=dtype))
+                buffers[key_b][expert_idx].copy_(lora_B.weight.data.to(dtype=dtype))
+
+    return buffers
+
+
+def _replace_peft_weights_with_views(
+    peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]],
+    buffers: dict[str, torch.Tensor],
+    moe_config: MOEArchConfig,
+) -> None:
+    """
+    Replace each PEFT LoRA module's .weight with a view into the contiguous buffer.
+
+    After this, optimizer.step() updates the buffer in-place via the view —
+    no copy needed to sync with C++.
+    """
+    gate_name, up_name, down_name = moe_config.weight_names
+    num_experts = moe_config.expert_num
+
+    proj_to_keys = {
+        gate_name: ("gate_lora_a", "gate_lora_b"),
+        up_name: ("up_lora_a", "up_lora_b"),
+        down_name: ("down_lora_a", "down_lora_b"),
+    }
+
+    for expert_idx in range(num_experts):
+        expert_loras = peft_lora_modules.get(expert_idx, {})
+        for proj_name, (key_a, key_b) in proj_to_keys.items():
+            if proj_name not in expert_loras:
+                continue
+            lora_A, lora_B = expert_loras[proj_name]
+            lora_A.weight = nn.Parameter(buffers[key_a][expert_idx], requires_grad=True)
+            lora_B.weight = nn.Parameter(buffers[key_b][expert_idx], requires_grad=True)
 
 
 def update_kt_lora_pointers(model: nn.Module):
