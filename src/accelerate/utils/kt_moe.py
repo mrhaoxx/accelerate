@@ -22,6 +22,7 @@ import gc
 import importlib.util as _u
 import math
 import os
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -901,6 +902,7 @@ class KTMoEFunction(torch.autograd.Function):
         wrapper: Any,
         peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]] | None,
         lora_ref: torch.Tensor,
+        lora_grad_buffers: dict[str, torch.Tensor] | None,
         hidden_size: int,
         num_experts_per_tok: int,
         layer_idx: int,
@@ -909,6 +911,7 @@ class KTMoEFunction(torch.autograd.Function):
         precomputed_output: torch.Tensor | None = None,
         weight_names: tuple[str, str, str] | None = None,
     ) -> torch.Tensor:
+        
         original_device = hidden_states.device
         original_dtype = hidden_states.dtype
         batch_size, seq_len, _ = hidden_states.shape
@@ -921,93 +924,94 @@ class KTMoEFunction(torch.autograd.Function):
 
         ctx.use_broadcast = wrapper is None
 
-        if precomputed_output is not None:
-            output = precomputed_output
-        elif dist_on:
-            # ---- Data-parallel gather/scatter path ----
-            # Each rank has its own batch. Gather all on rank 0, compute, scatter back.
-            # Both batch_size and seq_len may differ across ranks.
+        # if precomputed_output is not None:
+        output = precomputed_output
+        # elif dist_on:
+        #     # ---- Data-parallel gather/scatter path ----
+        #     # Each rank has its own batch. Gather all on rank 0, compute, scatter back.
+        #     # Both batch_size and seq_len may differ across ranks.
 
-            # 1. Exchange qlen from each rank
-            local_qlen_t = torch.tensor([qlen], device=original_device, dtype=torch.int64)
-            all_qlen_t = [torch.empty(1, device=original_device, dtype=torch.int64) for _ in range(world_size)]
-            dist.all_gather(all_qlen_t, local_qlen_t)
-            qlen_max = max(q.item() for q in all_qlen_t)
+        #     # 1. Exchange qlen from each rank
+        #     local_qlen_t = torch.tensor([qlen], device=original_device, dtype=torch.int64)
+        #     all_qlen_t = [torch.empty(1, device=original_device, dtype=torch.int64) for _ in range(world_size)]
+        #     dist.all_gather(all_qlen_t, local_qlen_t)
+        #     qlen_max = max(q.item() for q in all_qlen_t)
 
-            # 2. Flatten everything to 1D [qlen, ...] and pad to [qlen_max, ...]
-            #    CRITICAL: hidden_states must be flattened BEFORE padding so that
-            #    token positions align with topk_ids/topk_weights (also flat).
-            def _pad_flat(t, target_len, cur_len):
-                """Pad a [cur_len, ...] tensor to [target_len, ...]."""
-                if cur_len == target_len:
-                    return t.contiguous()
-                pad_shape = list(t.shape)
-                pad_shape[0] = target_len - cur_len
-                return torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0).contiguous()
+        #     # 2. Flatten everything to 1D [qlen, ...] and pad to [qlen_max, ...]
+        #     #    CRITICAL: hidden_states must be flattened BEFORE padding so that
+        #     #    token positions align with topk_ids/topk_weights (also flat).
+        #     def _pad_flat(t, target_len, cur_len):
+        #         """Pad a [cur_len, ...] tensor to [target_len, ...]."""
+        #         if cur_len == target_len:
+        #             return t.contiguous()
+        #         pad_shape = list(t.shape)
+        #         pad_shape[0] = target_len - cur_len
+        #         return torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0).contiguous()
 
-            hs_flat = hidden_states.view(qlen, hidden_size)           # [qlen, H]
-            hs_padded = _pad_flat(hs_flat, qlen_max, qlen)            # [qlen_max, H]
-            ids_padded = _pad_flat(topk_ids, qlen_max, qlen)          # [qlen_max, K]
-            wts_padded = _pad_flat(topk_weights, qlen_max, qlen)      # [qlen_max, K]
+        #     hs_flat = hidden_states.view(qlen, hidden_size)           # [qlen, H]
+        #     hs_padded = _pad_flat(hs_flat, qlen_max, qlen)            # [qlen_max, H]
+        #     ids_padded = _pad_flat(topk_ids, qlen_max, qlen)          # [qlen_max, K]
+        #     wts_padded = _pad_flat(topk_weights, qlen_max, qlen)      # [qlen_max, K]
 
-            # 3. Gather on rank 0
-            if rank == 0:
-                gathered_hs = [torch.empty_like(hs_padded) for _ in range(world_size)]
-                gathered_ids = [torch.empty_like(ids_padded) for _ in range(world_size)]
-                gathered_wts = [torch.empty_like(wts_padded) for _ in range(world_size)]
-            else:
-                gathered_hs = gathered_ids = gathered_wts = None
+        #     # 3. Gather on rank 0
+        #     if rank == 0:
+        #         gathered_hs = [torch.empty_like(hs_padded) for _ in range(world_size)]
+        #         gathered_ids = [torch.empty_like(ids_padded) for _ in range(world_size)]
+        #         gathered_wts = [torch.empty_like(wts_padded) for _ in range(world_size)]
+        #     else:
+        #         gathered_hs = gathered_ids = gathered_wts = None
 
-            dist.gather(hs_padded, gathered_hs, dst=0)
-            dist.gather(ids_padded, gathered_ids, dst=0)
-            dist.gather(wts_padded, gathered_wts, dst=0)
+        #     dist.gather(hs_padded, gathered_hs, dst=0)
+        #     dist.gather(ids_padded, gathered_ids, dst=0)
+        #     dist.gather(wts_padded, gathered_wts, dst=0)
 
-            # 4. Rank 0: run KT kernel on full gathered batch
-            if rank == 0:
-                all_hs = torch.cat(gathered_hs, dim=0)   # [qlen_max*W, H]
-                all_ids = torch.cat(gathered_ids, dim=0)  # [qlen_max*W, K]
-                all_wts = torch.cat(gathered_wts, dim=0)  # [qlen_max*W, K]
-                total_qlen = qlen_max * world_size
+        #     # 4. Rank 0: run KT kernel on full gathered batch
+        #     if rank == 0:
+        #         all_hs = torch.cat(gathered_hs, dim=0)   # [qlen_max*W, H]
+        #         all_ids = torch.cat(gathered_ids, dim=0)  # [qlen_max*W, K]
+        #         all_wts = torch.cat(gathered_wts, dim=0)  # [qlen_max*W, K]
+        #         total_qlen = qlen_max * world_size
 
-                all_output = wrapper.forward_sft(
-                    hidden_states=all_hs,
-                    expert_ids=all_ids,
-                    weights=all_wts,
-                    save_for_backward=training,
-                    output_device=original_device,
-                )
-                # all_output: [total_qlen, H] → split into per-rank chunks of qlen_max
-                all_output = all_output.to(dtype=original_dtype)
-                scatter_list = list(all_output.view(world_size, qlen_max, hidden_size).unbind(0))
-                scatter_list = [c.contiguous() for c in scatter_list]
-            else:
-                scatter_list = None
+        #         all_output = wrapper.forward_sft(
+        #             hidden_states=all_hs,
+        #             expert_ids=all_ids,
+        #             weights=all_wts,
+        #             save_for_backward=training,
+        #             output_device=original_device,
+        #         )
+        #         # all_output: [total_qlen, H] → split into per-rank chunks of qlen_max
+        #         all_output = all_output.to(dtype=original_dtype)
+        #         scatter_list = list(all_output.view(world_size, qlen_max, hidden_size).unbind(0))
+        #         scatter_list = [c.contiguous() for c in scatter_list]
+        #     else:
+        #         scatter_list = None
 
-            # 5. Scatter back and trim to local qlen
-            output_padded = torch.empty(qlen_max, hidden_size, device=original_device, dtype=original_dtype)
-            dist.scatter(output_padded, scatter_list, src=0)
-            output = output_padded[:qlen].view(batch_size, seq_len, hidden_size)
-        elif wrapper is not None:
-            # ---- Single-GPU path ----
-            input_flat = hidden_states.view(qlen, hidden_size)
-            expert_ids = topk_ids.view(qlen, num_experts_per_tok)
-            weights = topk_weights.view(qlen, num_experts_per_tok)
+        #     # 5. Scatter back and trim to local qlen
+        #     output_padded = torch.empty(qlen_max, hidden_size, device=original_device, dtype=original_dtype)
+        #     dist.scatter(output_padded, scatter_list, src=0)
+        #     output = output_padded[:qlen].view(batch_size, seq_len, hidden_size)
+        # elif wrapper is not None:
+        #     # ---- Single-GPU path ----
+        #     input_flat = hidden_states.view(qlen, hidden_size)
+        #     expert_ids = topk_ids.view(qlen, num_experts_per_tok)
+        #     weights = topk_weights.view(qlen, num_experts_per_tok)
 
-            output = wrapper.forward_sft(
-                hidden_states=input_flat,
-                expert_ids=expert_ids,
-                weights=weights,
-                save_for_backward=training,
-                output_device=original_device,
-            )
-            output = output.view(batch_size, seq_len, hidden_size).to(dtype=original_dtype)
-        else:
-            output = torch.empty(
-                batch_size, seq_len, hidden_size, device=original_device, dtype=original_dtype
-            )
+        #     output = wrapper.forward_sft(
+        #         hidden_states=input_flat,
+        #         expert_ids=expert_ids,
+        #         weights=weights,
+        #         save_for_backward=training,
+        #         output_device=original_device,
+        #     )
+        #     output = output.view(batch_size, seq_len, hidden_size).to(dtype=original_dtype)
+        # else:
+        #     output = torch.empty(
+        #         batch_size, seq_len, hidden_size, device=original_device, dtype=original_dtype
+        #     )
 
         ctx.wrapper = wrapper
         ctx.peft_lora_modules = peft_lora_modules
+        ctx.lora_grad_buffers = lora_grad_buffers
         ctx.hidden_size = hidden_size
         ctx.qlen = qlen
         ctx.batch_size = batch_size
@@ -1089,6 +1093,22 @@ class KTMoEFunction(torch.autograd.Function):
                 all_grad_input = all_grad_input.to(dtype=ctx.original_dtype)
                 all_grad_weights = all_grad_weights.to(dtype=torch.bfloat16)
 
+                # Accumulate KT-managed LoRA grads into per-layer grad buffers (rank 0 only).
+                # Grad buffers are views used by the optimizer; no per-expert copying.
+                if getattr(ctx, "train_lora", False) and getattr(ctx, "lora_grad_buffers", None):
+                    for k in (
+                        "grad_gate_lora_a",
+                        "grad_gate_lora_b",
+                        "grad_up_lora_a",
+                        "grad_up_lora_b",
+                        "grad_down_lora_a",
+                        "grad_down_lora_b",
+                    ):
+                        tmp = getattr(ctx.wrapper, k, None)
+                        buf = ctx.lora_grad_buffers.get(k) if tmp is not None else None
+                        if buf is not None:
+                            buf.add_(tmp.to(dtype=buf.dtype))
+
                 scatter_gi = list(all_grad_input.view(world_size, qlen_max, -1).unbind(0))
                 scatter_gi = [c.contiguous() for c in scatter_gi]
                 scatter_gw = list(all_grad_weights.view(world_size, qlen_max, -1).unbind(0))
@@ -1123,63 +1143,28 @@ class KTMoEFunction(torch.autograd.Function):
                 raise ValueError("KTMoEWrapper.backward returned unexpected format.")
             grad_input = grad_input.view(batch_size, seq_len, hidden_size).to(dtype=ctx.original_dtype)
             grad_weights = grad_weights.to(dtype=torch.bfloat16)
+
+            # Accumulate KT-managed LoRA grads into per-layer grad buffers (single-process / rank 0).
+            if getattr(ctx, "train_lora", False) and getattr(ctx, "lora_grad_buffers", None) and ctx.wrapper is not None:
+                for k in (
+                    "grad_gate_lora_a",
+                    "grad_gate_lora_b",
+                    "grad_up_lora_a",
+                    "grad_up_lora_b",
+                    "grad_down_lora_a",
+                    "grad_down_lora_b",
+                ):
+                    tmp = getattr(ctx.wrapper, k, None)
+                    buf = ctx.lora_grad_buffers.get(k) if tmp is not None else None
+                    if buf is not None:
+                        buf.add_(tmp.to(dtype=buf.dtype))
         else:
             # No wrapper, no dist — shouldn't happen in normal flow
             grad_input = torch.zeros(batch_size, seq_len, hidden_size, device=ctx.original_device, dtype=ctx.original_dtype)
             grad_weights = torch.zeros(ctx.weights_shape, device=ctx.weights_device, dtype=ctx.weights_dtype)
             grad_loras = None
 
-        # LoRA gradients: only rank 0 needs them (only rank 0 has KT wrapper).
-        # No broadcast needed — non-rank-0 optimizer skips params with grad=None.
-        # PEFT LoRA: write gradients to PEFT modules directly.
-        if ctx.train_lora and ctx.peft_lora_modules is not None and grad_loras is not None and rank == 0:
-            # Map from C++ kernel key prefixes to weight_names indices
-            # weight_names = (gate_name, up_name, down_name), e.g., ("gate_proj", "up_proj", "down_proj")
-            gate_name, up_name, down_name = ctx.weight_names
-
-            # Helper to write gradient to PEFT LoRA module
-            def _write_grad_to_peft(grad_key: str, proj_name: str, is_lora_b: bool):
-                """Write stacked gradient tensor to individual PEFT LoRA modules."""
-                grad_tensor = grad_loras.get(grad_key) or grad_loras.get(f"grad_{grad_key}")
-                if grad_tensor is None:
-                    return
-
-                # grad_tensor shape: [num_experts, ...], split by expert
-                num_experts = grad_tensor.shape[0]
-                for expert_idx in range(num_experts):
-                    expert_loras = ctx.peft_lora_modules.get(expert_idx, {})
-                    lora_pair = expert_loras.get(proj_name)
-                    if lora_pair is None:
-                        continue
-
-                    lora_module = lora_pair[1] if is_lora_b else lora_pair[0]  # (lora_A, lora_B)
-                    if not hasattr(lora_module, 'weight') or not lora_module.weight.requires_grad:
-                        continue
-
-                    param = lora_module.weight
-                    expert_grad = grad_tensor[expert_idx].clone().to(dtype=param.dtype, device=param.device)
-
-                    # Scale gradient by world_size (same as before)
-                    if world_size > 1:
-                        expert_grad /= world_size
-
-                    # Accumulate gradient (supports gradient_accumulation_steps).
-                    # C++ grad_lora buffers are now zeroed before each backward call,
-                    # so we need to accumulate across micro-batches here.
-                    if param.grad is None:
-                        param.grad = expert_grad
-                    else:
-                        param.grad = param.grad + expert_grad
-
-            # Write gradients for all projections
-            _write_grad_to_peft("gate_lora_a", gate_name, is_lora_b=False)
-            _write_grad_to_peft("gate_lora_b", gate_name, is_lora_b=True)
-            _write_grad_to_peft("up_lora_a", up_name, is_lora_b=False)
-            _write_grad_to_peft("up_lora_b", up_name, is_lora_b=True)
-            _write_grad_to_peft("down_lora_a", down_name, is_lora_b=False)
-            _write_grad_to_peft("down_lora_b", down_name, is_lora_b=True)
-
-        return grad_input, None, grad_weights, None, None, None, None, None, None, None, None, None, None
+        return grad_input, None, grad_weights, None, None, None, None, None, None, None, None, None, None, None
 
 
 # =============================================================================
@@ -1258,6 +1243,7 @@ class KTMoELayerWrapper(nn.Module):
         return result
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        
         import torch.distributed as dist
         dist_on = dist.is_initialized() and dist.get_world_size() > 1
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -1341,6 +1327,9 @@ class KTMoELayerWrapper(nn.Module):
                 )
             self.update_lora_pointers()
             self._lora_pointers_dirty = False
+            
+            
+
 
         # Overlap: rank 0 submits CPU expert work, all ranks compute GPU shared_experts concurrently.
         # In dist mode, all ranks MUST enter _forward_with_overlap together because it uses
@@ -1391,30 +1380,31 @@ class KTMoELayerWrapper(nn.Module):
         gpu_output = None
         # In dist mode, all ranks must participate in overlap (gather/scatter collectives).
         # In single-GPU mode, only rank 0 (which has wrapper) uses overlap.
-        if use_overlap and (dist_on or self.wrapper is not None):
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoELayerWrapper.forward overlap path start layer=%s",
-                    rank,
-                    self.layer_idx,
-                )
-            precomputed_output, gpu_output = self._forward_with_overlap(
-                hidden_states,
-                topk_ids,
-                topk_weights,
-                compute_gpu_output,
-                save_for_backward,
+  
+        if KT_DEBUG:
+            logger.warning(
+                "[KT DEBUG] rank %s KTMoELayerWrapper.forward overlap path start layer=%s",
+                rank,
+                self.layer_idx,
             )
-            if KT_DEBUG:
-                logger.warning(
-                    "[KT DEBUG] rank %s KTMoELayerWrapper.forward overlap path done layer=%s precomputed=%s %s",
-                    rank,
-                    self.layer_idx,
-                    tuple(precomputed_output.shape),
-                    precomputed_output.dtype,
-                )
-        else:
-            gpu_output = compute_gpu_output()
+            
+        precomputed_output, gpu_output = self._forward_with_overlap(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            compute_gpu_output,
+            save_for_backward,
+        )
+        if KT_DEBUG:
+            logger.warning(
+                "[KT DEBUG] rank %s KTMoELayerWrapper.forward overlap path done layer=%s precomputed=%s %s",
+                rank,
+                self.layer_idx,
+                tuple(precomputed_output.shape),
+                precomputed_output.dtype,
+            )
+
+            
 
         lora_ref = hidden_states.new_empty(())
         if train_lora and self._peft_lora_modules:
@@ -1434,6 +1424,7 @@ class KTMoELayerWrapper(nn.Module):
             self.wrapper,
             self._peft_lora_modules,  # Pass PEFT LoRA modules instead of lora_params
             lora_ref,
+            getattr(self, "_peft_lora_grad_buffers", None),
             self.hidden_size,
             self.moe_config.num_experts_per_tok,
             self.layer_idx,
@@ -1442,6 +1433,7 @@ class KTMoELayerWrapper(nn.Module):
             precomputed_output,
             self.moe_config.weight_names,  # (gate_name, up_name, down_name) for grad mapping
         )
+        
 
         if gpu_output is not None:
             if KT_DEBUG:
@@ -1460,6 +1452,7 @@ class KTMoELayerWrapper(nn.Module):
                 tuple(moe_output.shape),
                 moe_output.dtype,
             )
+            
         return moe_output
 
     def _compute_routing(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1490,6 +1483,7 @@ class KTMoELayerWrapper(nn.Module):
         save_for_backward: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         import torch.distributed as dist
+        
 
         batch_size, seq_len, _ = hidden_states.shape
         original_device = hidden_states.device
@@ -1500,6 +1494,7 @@ class KTMoELayerWrapper(nn.Module):
         world_size = dist.get_world_size() if dist_on else 1
 
         qlen = batch_size * seq_len
+        
 
         if dist_on:
             # ---- Gather inputs from all ranks before submitting CPU work ----
@@ -1585,7 +1580,7 @@ class KTMoELayerWrapper(nn.Module):
             gpu_output = compute_gpu_output()
             cpu_output_gpu = self.wrapper.sync_forward_sft(output_device=original_device)
             precomputed_output = cpu_output_gpu.view(batch_size, seq_len, self.hidden_size).to(dtype=original_dtype)
-
+            
         return precomputed_output, gpu_output
 
     def update_lora_pointers(self):
@@ -2097,14 +2092,17 @@ def kt_adapt_peft_lora(model: nn.Module) -> None:
 
         # Allocate contiguous bf16 buffers and populate with initial PEFT values (all ranks)
         lora_buffers = _create_lora_view_buffers(peft_lora_modules, moe_config, torch.bfloat16)
+        lora_grad_buffers = _create_lora_grad_buffers(peft_lora_modules, moe_config)
 
         # Rank 0: pass buffers to C++ wrapper (init_lora_weights stores them via .contiguous() no-op)
         if is_rank_0 and wrapper.wrapper is not None:
+            # concat lora_buffers and lora_grad_buffers into single dict
+            lora_buffers.update(lora_grad_buffers)
             wrapper.wrapper.init_lora_weights(**lora_buffers)
             logger.info(f"[kt_adapt_peft_lora] Layer {layer_idx}: synced PEFT LoRA to C++ kernel")
 
         # All ranks: replace PEFT weights with views into the contiguous buffers
-        _replace_peft_weights_with_views(peft_lora_modules, lora_buffers, moe_config)
+        _replace_peft_weights_with_views(peft_lora_modules, lora_buffers, lora_grad_buffers, moe_config)
 
         adapted_count += 1
 
@@ -2160,84 +2158,6 @@ def kt_adapt_peft_lora(model: nn.Module) -> None:
     logger.info(f"[kt_adapt_peft_lora] Adapted {adapted_count} layers (PEFT LoRA mode)")
 
 
-def _collect_peft_lora_tensors(
-    peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]],
-    moe_config: MOEArchConfig,
-    dtype: torch.dtype,
-) -> dict[str, torch.Tensor]:
-    """
-    Collect PEFT LoRA weights into stacked tensors for C++ kernel.
-
-    Args:
-        peft_lora_modules: {expert_idx: {proj_name: (lora_A, lora_B)}}
-        moe_config: MoE architecture config
-        dtype: Target dtype
-
-    Returns:
-        Dict with gate_lora_a, gate_lora_b, up_lora_a, up_lora_b, down_lora_a, down_lora_b tensors
-    """
-    gate_name, up_name, down_name = moe_config.weight_names
-    num_experts = moe_config.expert_num
-
-    # Get shape info from first expert
-    first_expert_loras = peft_lora_modules.get(0, {})
-    if not first_expert_loras:
-        raise RuntimeError("No PEFT LoRA found on expert 0")
-
-    gate_lora = first_expert_loras.get(gate_name)
-    if gate_lora is None:
-        raise RuntimeError(f"No PEFT LoRA found on expert 0 {gate_name}")
-
-    lora_A_weight = gate_lora[0].weight  # [rank, in_features]
-    lora_rank = lora_A_weight.shape[0]
-    hidden_size = lora_A_weight.shape[1]
-    intermediate_size = gate_lora[1].weight.shape[0]  # [out_features, rank]
-
-    # Collect all experts' LoRA weights
-    gate_lora_a_list, gate_lora_b_list = [], []
-    up_lora_a_list, up_lora_b_list = [], []
-    down_lora_a_list, down_lora_b_list = [], []
-
-    for expert_idx in range(num_experts):
-        expert_loras = peft_lora_modules.get(expert_idx, {})
-
-        # Gate proj
-        if gate_name in expert_loras:
-            lora_A, lora_B = expert_loras[gate_name]
-            gate_lora_a_list.append(lora_A.weight.data.to(dtype=dtype).cpu())
-            gate_lora_b_list.append(lora_B.weight.data.to(dtype=dtype).cpu())
-        else:
-            gate_lora_a_list.append(torch.zeros(lora_rank, hidden_size, dtype=dtype))
-            gate_lora_b_list.append(torch.zeros(intermediate_size, lora_rank, dtype=dtype))
-
-        # Up proj
-        if up_name in expert_loras:
-            lora_A, lora_B = expert_loras[up_name]
-            up_lora_a_list.append(lora_A.weight.data.to(dtype=dtype).cpu())
-            up_lora_b_list.append(lora_B.weight.data.to(dtype=dtype).cpu())
-        else:
-            up_lora_a_list.append(torch.zeros(lora_rank, hidden_size, dtype=dtype))
-            up_lora_b_list.append(torch.zeros(intermediate_size, lora_rank, dtype=dtype))
-
-        # Down proj
-        if down_name in expert_loras:
-            lora_A, lora_B = expert_loras[down_name]
-            down_lora_a_list.append(lora_A.weight.data.to(dtype=dtype).cpu())
-            down_lora_b_list.append(lora_B.weight.data.to(dtype=dtype).cpu())
-        else:
-            down_lora_a_list.append(torch.zeros(lora_rank, intermediate_size, dtype=dtype))
-            down_lora_b_list.append(torch.zeros(hidden_size, lora_rank, dtype=dtype))
-
-    return {
-        "gate_lora_a": torch.stack(gate_lora_a_list, dim=0).contiguous(),
-        "gate_lora_b": torch.stack(gate_lora_b_list, dim=0).contiguous(),
-        "up_lora_a": torch.stack(up_lora_a_list, dim=0).contiguous(),
-        "up_lora_b": torch.stack(up_lora_b_list, dim=0).contiguous(),
-        "down_lora_a": torch.stack(down_lora_a_list, dim=0).contiguous(),
-        "down_lora_b": torch.stack(down_lora_b_list, dim=0).contiguous(),
-    }
-
-
 def _create_lora_view_buffers(
     peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]],
     moe_config: MOEArchConfig,
@@ -2287,10 +2207,37 @@ def _create_lora_view_buffers(
 
     return buffers
 
+def _create_lora_grad_buffers(peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]],moe_config: MOEArchConfig,dtype: torch.dtype = torch.bfloat16):
+    gate_name, up_name, down_name = moe_config.weight_names
+    num_experts = moe_config.expert_num
+
+    first_expert_loras = peft_lora_modules.get(0, {})
+    if not first_expert_loras:
+        raise RuntimeError("No PEFT LoRA found on expert 0")
+    gate_lora = first_expert_loras.get(gate_name)
+    if gate_lora is None:
+        raise RuntimeError(f"No PEFT LoRA found on expert 0 {gate_name}")
+
+    lora_rank = gate_lora[0].weight.shape[0]
+    hidden_size = gate_lora[0].weight.shape[1]
+    intermediate_size = gate_lora[1].weight.shape[0]
+    
+    buffers = {
+        "grad_gate_lora_a": torch.zeros(num_experts, lora_rank, hidden_size, dtype=dtype, device="cpu"),
+        "grad_gate_lora_b": torch.zeros(num_experts, intermediate_size, lora_rank, dtype=dtype, device="cpu"),
+        "grad_up_lora_a": torch.zeros(num_experts, lora_rank, hidden_size, dtype=dtype, device="cpu"),
+        "grad_up_lora_b": torch.zeros(num_experts, intermediate_size, lora_rank, dtype=dtype, device="cpu"),
+        "grad_down_lora_a": torch.zeros(num_experts, lora_rank, intermediate_size, dtype=dtype, device="cpu"),
+        "grad_down_lora_b": torch.zeros(num_experts, hidden_size, lora_rank, dtype=dtype, device="cpu"),
+    }
+
+    return buffers
+
 
 def _replace_peft_weights_with_views(
     peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]],
     buffers: dict[str, torch.Tensor],
+    grad_buffers: dict[str, torch.Tensor],
     moe_config: MOEArchConfig,
 ) -> None:
     """
@@ -2316,7 +2263,8 @@ def _replace_peft_weights_with_views(
             lora_A, lora_B = expert_loras[proj_name]
             lora_A.weight = nn.Parameter(buffers[key_a][expert_idx], requires_grad=True)
             lora_B.weight = nn.Parameter(buffers[key_b][expert_idx], requires_grad=True)
-
+            lora_A.weight.grad = grad_buffers["grad_"+key_a][expert_idx]
+            lora_B.weight.grad = grad_buffers["grad_"+key_b][expert_idx]
 
 def update_kt_lora_pointers(model: nn.Module):
     """Mark KT wrapper LoRA pointers as dirty after optimizer.step()."""
@@ -2335,18 +2283,18 @@ def update_kt_lora_pointers(model: nn.Module):
             wrapper._lora_pointers_dirty = True
 
 
-
-def sync_kt_lora_gradients(model: nn.Module):
+def sync_kt_lora_gradients(model: nn.Module) -> None:
     """
-    Synchronize KT LoRA parameter gradients across distributed ranks.
+    Synchronize KT-managed LoRA gradients across ranks.
 
-    In FSDP2 training, KT LoRA params are marked as ignored (not sharded), so their
-    gradients are not automatically synchronized. This function performs an all-reduce
-    on the gradients to ensure consistent updates across all ranks.
+    KT computes expert LoRA gradients only on rank 0 (gather/scatter path). This function broadcasts the
+    per-layer contiguous grad buffers from rank 0 to all ranks so that:
+      - gradient clipping sees identical grads on every rank
+      - optimizer.step() applies identical updates
     """
     import torch.distributed as dist
 
-    if not dist.is_initialized():
+    if not (dist.is_initialized() and dist.get_world_size() > 1):
         return
 
     world_size = dist.get_world_size()
