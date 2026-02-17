@@ -2839,7 +2839,7 @@ class KTransformersPlugin:
     kt_sharded_metadata: dict | None = None
     bypass_device_map_check: bool | None = None
     skip_device_placement: bool | None = None
-    allowed_distributed_types: tuple[DistributedType, ...] = (DistributedType.NO, DistributedType.FSDP)
+    allowed_distributed_types: tuple[DistributedType, ...] = (DistributedType.NO, DistributedType.FSDP, DistributedType.MULTI_GPU)
     require_single_process: bool = False
     wrap_fn: Callable[..., Any] | None = None
     wrap_kwargs: dict[str, Any] | None = None
@@ -2899,6 +2899,9 @@ class KTransformersPlugin:
 
         if self.lora_alpha is None:
             self.lora_alpha = self._get_env_float("ACCELERATE_KT_LORA_ALPHA", None)
+
+        if self.lora_alpha is None and self.lora_rank is not None:
+            self.lora_alpha = float(self.lora_rank * 2)
 
         if self.model_max_length is None:
             self.model_max_length = self._get_env_int("ACCELERATE_KT_MODEL_MAX_LENGTH", None)

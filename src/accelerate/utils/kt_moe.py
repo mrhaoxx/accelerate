@@ -902,7 +902,6 @@ class KTMoEFunction(torch.autograd.Function):
         wrapper: Any,
         peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]] | None,
         lora_ref: torch.Tensor,
-        lora_grad_buffers: dict[str, torch.Tensor] | None,
         hidden_size: int,
         num_experts_per_tok: int,
         layer_idx: int,
@@ -1011,7 +1010,6 @@ class KTMoEFunction(torch.autograd.Function):
 
         ctx.wrapper = wrapper
         ctx.peft_lora_modules = peft_lora_modules
-        ctx.lora_grad_buffers = lora_grad_buffers
         ctx.hidden_size = hidden_size
         ctx.qlen = qlen
         ctx.batch_size = batch_size
@@ -1076,38 +1074,20 @@ class KTMoEFunction(torch.autograd.Function):
                 all_go = torch.cat(gathered_go, dim=0)  # [qlen_max*W, H]
                 total_qlen = qlen_max * world_size
 
-                # C++ kernel always computes and returns grad_loras regardless of lora_params
                 backward_out = ctx.wrapper.backward(
                     all_go,
                     output_device=ctx.original_device,
                 )
                 if isinstance(backward_out, tuple) and len(backward_out) == 2:
                     all_grad_input, all_grad_weights = backward_out
-                    grad_loras = None
                 elif isinstance(backward_out, tuple) and len(backward_out) == 3:
-                    all_grad_input, grad_loras, all_grad_weights = backward_out
+                    all_grad_input, _, all_grad_weights = backward_out
                 else:
                     raise ValueError("KTMoEWrapper.backward returned unexpected format.")
 
                 # all_grad_input: [total_qlen, H], all_grad_weights: [total_qlen, K]
                 all_grad_input = all_grad_input.to(dtype=ctx.original_dtype)
                 all_grad_weights = all_grad_weights.to(dtype=torch.bfloat16)
-
-                # Accumulate KT-managed LoRA grads into per-layer grad buffers (rank 0 only).
-                # Grad buffers are views used by the optimizer; no per-expert copying.
-                if getattr(ctx, "train_lora", False) and getattr(ctx, "lora_grad_buffers", None):
-                    for k in (
-                        "grad_gate_lora_a",
-                        "grad_gate_lora_b",
-                        "grad_up_lora_a",
-                        "grad_up_lora_b",
-                        "grad_down_lora_a",
-                        "grad_down_lora_b",
-                    ):
-                        tmp = getattr(ctx.wrapper, k, None)
-                        buf = ctx.lora_grad_buffers.get(k) if tmp is not None else None
-                        if buf is not None:
-                            buf.add_(tmp.to(dtype=buf.dtype))
 
                 scatter_gi = list(all_grad_input.view(world_size, qlen_max, -1).unbind(0))
                 scatter_gi = [c.contiguous() for c in scatter_gi]
@@ -1116,7 +1096,6 @@ class KTMoEFunction(torch.autograd.Function):
             else:
                 scatter_gi = None
                 scatter_gw = None
-                grad_loras = None
 
             # 5. Scatter back and trim to local qlen
             gi_padded = torch.empty(qlen_max, hidden_size, device=ctx.original_device, dtype=ctx.original_dtype)
@@ -1129,42 +1108,24 @@ class KTMoEFunction(torch.autograd.Function):
         elif not ctx.use_broadcast:
             # ---- Single-GPU path ----
             grad_output_flat = grad_output.view(qlen, hidden_size)
-            # C++ kernel always computes and returns grad_loras regardless of lora_params
             backward_out = ctx.wrapper.backward(
                 grad_output_flat,
                 output_device=ctx.original_device,
             )
             if isinstance(backward_out, tuple) and len(backward_out) == 2:
                 grad_input, grad_weights = backward_out
-                grad_loras = None
             elif isinstance(backward_out, tuple) and len(backward_out) == 3:
-                grad_input, grad_loras, grad_weights = backward_out
+                grad_input, _, grad_weights = backward_out
             else:
                 raise ValueError("KTMoEWrapper.backward returned unexpected format.")
             grad_input = grad_input.view(batch_size, seq_len, hidden_size).to(dtype=ctx.original_dtype)
             grad_weights = grad_weights.to(dtype=torch.bfloat16)
-
-            # Accumulate KT-managed LoRA grads into per-layer grad buffers (single-process / rank 0).
-            if getattr(ctx, "train_lora", False) and getattr(ctx, "lora_grad_buffers", None) and ctx.wrapper is not None:
-                for k in (
-                    "grad_gate_lora_a",
-                    "grad_gate_lora_b",
-                    "grad_up_lora_a",
-                    "grad_up_lora_b",
-                    "grad_down_lora_a",
-                    "grad_down_lora_b",
-                ):
-                    tmp = getattr(ctx.wrapper, k, None)
-                    buf = ctx.lora_grad_buffers.get(k) if tmp is not None else None
-                    if buf is not None:
-                        buf.add_(tmp.to(dtype=buf.dtype))
         else:
             # No wrapper, no dist — shouldn't happen in normal flow
             grad_input = torch.zeros(batch_size, seq_len, hidden_size, device=ctx.original_device, dtype=ctx.original_dtype)
             grad_weights = torch.zeros(ctx.weights_shape, device=ctx.weights_device, dtype=ctx.weights_dtype)
-            grad_loras = None
 
-        return grad_input, None, grad_weights, None, None, None, None, None, None, None, None, None, None, None
+        return grad_input, None, grad_weights, None, None, None, None, None, None, None, None, None, None
 
 
 # =============================================================================
@@ -1223,6 +1184,7 @@ class KTMoELayerWrapper(nn.Module):
         self._peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]] | None = None
         self._peft_lora_rank: int = 0
         self._peft_lora_alpha: float = 0.0
+        self._skip_lora: bool = False  # True when using SkipLoRA backend (no LoRA on experts)
 
         self._lora_pointers_dirty = False
 
@@ -1424,7 +1386,6 @@ class KTMoELayerWrapper(nn.Module):
             self.wrapper,
             self._peft_lora_modules,  # Pass PEFT LoRA modules instead of lora_params
             lora_ref,
-            getattr(self, "_peft_lora_grad_buffers", None),
             self.hidden_size,
             self.moe_config.num_experts_per_tok,
             self.layer_idx,
@@ -1652,8 +1613,15 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
         "AMXINT8_SkipLoRA": "AMXINT8_SFT_SkipLoRA",
         "AMXINT4_SkipLoRA": "AMXINT4_SFT_SkipLoRA",
     }
+    # Build case-insensitive lookup to handle common typos like "SkipLora" vs "SkipLoRA"
+    _kt_backend_map_lower = {k.lower(): v for k, v in kt_backend_map.items()}
     kt_backend = getattr(kt_plugin, "kt_backend", "AMXBF16")
-    kt_method = kt_backend_map.get(kt_backend, "AMXBF16_SFT")
+    kt_method = kt_backend_map.get(kt_backend) or _kt_backend_map_lower.get(kt_backend.lower(), "AMXBF16_SFT")
+    if kt_method != kt_backend_map.get(kt_backend):
+        logger.warning(
+            f"kt_backend '{kt_backend}' matched via case-insensitive lookup → '{kt_method}'. "
+            f"Please use the exact name from: {list(kt_backend_map.keys())}"
+        )
 
     if "SkipLoRA" in kt_method:
         logger.info(f"Using SkipLoRA backend: {kt_method} (MoE LoRA gradients will be skipped)")
@@ -1819,6 +1787,7 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
             hidden_size=hidden_size,
             layer_idx=layer_idx,
         )
+        layer_wrapper._skip_lora = "SkipLoRA" in kt_method
 
         setattr(layer, moe_config.moe_layer_attr, layer_wrapper)
         # Base weights have been copied into the C++ kernel's internal BufferB format.
@@ -2089,6 +2058,22 @@ def kt_adapt_peft_lora(model: nn.Module) -> None:
 
         # Store PEFT LoRA references on wrapper
         wrapper._peft_lora_modules = peft_lora_modules
+
+        # SkipLoRA mode: if no LoRA found on experts, skip buffer creation
+        if not peft_lora_modules:
+            if getattr(wrapper, '_skip_lora', False):
+                logger.info(
+                    f"[kt_adapt_peft_lora] Layer {layer_idx}: SkipLoRA mode, "
+                    f"no PEFT LoRA on experts — skipping LoRA buffer creation"
+                )
+                adapted_count += 1
+                continue
+            else:
+                raise RuntimeError(
+                    f"[kt_adapt_peft_lora] Layer {layer_idx}: No PEFT LoRA found on any expert. "
+                    f"If you intend to train without expert LoRA, use a SkipLoRA backend "
+                    f"(e.g., kt_backend: AMXINT8_SkipLoRA)."
+                )
 
         # Allocate contiguous bf16 buffers and populate with initial PEFT values (all ranks)
         lora_buffers = _create_lora_view_buffers(peft_lora_modules, moe_config, torch.bfloat16)

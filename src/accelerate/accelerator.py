@@ -1564,6 +1564,8 @@ class Accelerator:
         if self.parallelism_config and self.parallelism_config.cp_enabled:
             args = self._prepare_cp(*args)
 
+        _rank = os.environ.get("LOCAL_RANK", "?")
+        print(f"[DIAG rank={_rank}] prepare: distributed_type={self.distributed_type}, is_fsdp2={self.is_fsdp2}", flush=True)
         if self.fp8_backend == FP8BackendType.TE:
             args = self._prepare_te(*args)
         elif self.fp8_backend == FP8BackendType.AO:
@@ -1573,8 +1575,10 @@ class Accelerator:
         elif self.distributed_type == DistributedType.MEGATRON_LM:
             result = self._prepare_megatron_lm(*args)
         elif self.is_fsdp2:
+            print(f"[DIAG rank={_rank}] prepare: entering _prepare_fsdp2", flush=True)
             result = self._prepare_fsdp2(*args)
         else:
+            print(f"[DIAG rank={_rank}] prepare: entering else branch (_prepare_one)", flush=True)
             if self.fp8_backend == FP8BackendType.MSAMP:
                 args, device_placement = self._prepare_msamp(*args, device_placement=device_placement)
             result = tuple(
@@ -1601,6 +1605,9 @@ class Accelerator:
         return result if len(result) > 1 else result[0]
 
     def _prepare_tp(self, *args):
+        import os as _os, sys as _sys
+        _rank = _os.environ.get("LOCAL_RANK", "?")
+        print(f"[DIAG rank={_rank}] _prepare_tp entered", file=_sys.stderr, flush=True)
         # First pass: prepare everything except schedulers (and model, which is prepared separately below)
         result = [
             self._prepare_one(obj, first_pass=True) if not isinstance(obj, torch.nn.Module) else obj for obj in args
@@ -1610,30 +1617,117 @@ class Accelerator:
         result = [self._prepare_one(obj) if not isinstance(obj, torch.nn.Module) else obj for obj in result]
 
         device_mesh = self.torch_device_mesh
+        print(f"[DIAG rank={_rank}] _prepare_tp device_mesh={device_mesh}", file=_sys.stderr, flush=True)
 
         for arg in result:
             if not isinstance(arg, torch.nn.Module):
                 continue
 
-            from torch.distributed.tensor import DTensor, Replicate
+            from torch.distributed.tensor import DTensor, Replicate, Shard
             from transformers.integrations.tensor_parallel import ReplicateParallel
 
             model: torch.nn.Module = arg
-            tp_plan = ReplicateParallel
+            tp_mesh = device_mesh["tp"]
+            tp_rank = int(tp_mesh.get_local_rank())
+            tp_size = int(tp_mesh.size())
 
-            for name, param in model.named_parameters():
+            _n_dtensor, _n_cuda, _n_skip, _n_lora = 0, 0, 0, 0
+            if not hasattr(model, '_tp_lora_shard_info'):
+                model._tp_lora_shard_info = {}
+            for name, param in list(model.named_parameters()):
                 if isinstance(param, DTensor):
+                    _n_dtensor += 1
+                    continue
+                if param.device.type != "cuda":
+                    _n_skip += 1
                     continue
 
-                dp = DTensor.from_local(param, device_mesh=device_mesh["tp"], placements=[Replicate()])
+                is_lora_b = ".lora_B." in name
+                is_lora_a = ".lora_A." in name
+
+                if is_lora_a or is_lora_b:
+                    # Find parent PEFT module to check base layer's TP plan
+                    parts = name.split(".")
+                    keyword = "lora_B" if is_lora_b else "lora_A"
+                    lora_idx = next(i for i, p in enumerate(parts) if p == keyword)
+                    peft_path = ".".join(parts[:lora_idx])
+                    try:
+                        peft_mod = model.get_submodule(peft_path)
+                        base = getattr(peft_mod, "base_layer", None)
+                    except Exception:
+                        base = None
+
+                    if base is not None and hasattr(base, "weight") and isinstance(base.weight, DTensor):
+                        base_placements = base.weight.placements
+                        is_colwise = any(isinstance(p, Shard) and p.dim in (0, -2) for p in base_placements)
+                        is_rowwise = any(isinstance(p, Shard) and p.dim in (1, -1) for p in base_placements)
+
+                        if is_lora_b and is_colwise:
+                            # Colwise base: shard lora_B on dim 0 (out_features)
+                            out_f = param.shape[0]
+                            local_out = out_f // tp_size
+                            new_w = param.data[tp_rank * local_out : (tp_rank + 1) * local_out].contiguous()
+                            mod_path, attr = name.rsplit(".", 1)
+                            setattr(model.get_submodule(mod_path), attr,
+                                    torch.nn.Parameter(new_w, requires_grad=param.requires_grad))
+                            _n_lora += 1
+                            model._tp_lora_shard_info[name] = {'shard_dim': 0, 'tp_size': tp_size}
+                            print(f"[TP-LoRA rank={_rank}] colwise shard lora_B: {name} {list(param.shape)}->{list(new_w.shape)}", file=_sys.stderr, flush=True)
+                            continue
+
+                        if is_lora_a and is_rowwise:
+                            # Rowwise base: shard lora_A on dim 1 (in_features) + allreduce hook
+                            in_f = param.shape[1]
+                            local_in = in_f // tp_size
+                            new_w = param.data[:, tp_rank * local_in : (tp_rank + 1) * local_in].contiguous()
+                            mod_path, attr = name.rsplit(".", 1)
+                            lora_a_module = model.get_submodule(mod_path)
+                            setattr(lora_a_module, attr,
+                                    torch.nn.Parameter(new_w, requires_grad=param.requires_grad))
+                            # Register allreduce hook: partial matmul results must be summed across TP ranks
+                            _tp_group = tp_mesh.get_group()
+                            def _allreduce_hook(_mod, _inp, output, group=_tp_group):
+                                torch.distributed.all_reduce(output, group=group)
+                                return output
+                            lora_a_module.register_forward_hook(_allreduce_hook)
+                            _n_lora += 1
+                            model._tp_lora_shard_info[name] = {'shard_dim': 1, 'tp_size': tp_size}
+                            print(f"[TP-LoRA rank={_rank}] rowwise shard lora_A+allreduce: {name} {list(param.shape)}->{list(new_w.shape)}", file=_sys.stderr, flush=True)
+                            continue
+
+                        if is_lora_a and is_colwise:
+                            # lora_A is replicated on colwise layer: each rank gets partial gradient
+                            # (through its sharded lora_B), so we need gradient all-reduce to keep A in sync.
+                            _tp_group = tp_mesh.get_group()
+                            param.register_hook(
+                                lambda grad, group=_tp_group: (
+                                    torch.distributed.all_reduce(grad, group=group), grad
+                                )[1]
+                            )
+                            _n_lora += 1
+                            print(f"[TP-LoRA rank={_rank}] colwise lora_A grad allreduce: {name} {list(param.shape)}", file=_sys.stderr, flush=True)
+                        else:
+                            # lora_B on rowwise: gradient is naturally replicated (no sync needed)
+                            print(f"[TP-LoRA rank={_rank}] skip (no shard needed): {name} {list(param.shape)}", file=_sys.stderr, flush=True)
+
+                    # LoRA param on non-TP-sharded layer (or couldn't determine): skip wrapping
+                    continue
+
+                # Non-LoRA param: wrap as Replicate (original behavior)
+                _n_cuda += 1
+                dp = DTensor.from_local(param, device_mesh=tp_mesh, placements=[Replicate()])
                 param_name, param_type = name.rsplit(".", 1)
                 module_to_tp = model.get_submodule(param_name)
 
-                tp_plan().prepare_module_tp(module_to_tp, device_mesh["tp"])
+                ReplicateParallel().prepare_module_tp(module_to_tp, tp_mesh)
                 if not isinstance(dp, torch.nn.Parameter):
                     dp = torch.nn.Parameter(dp, requires_grad=param.requires_grad)
                 setattr(module_to_tp, param_type, dp)
 
+            print(f"[DIAG rank={_rank}] _prepare_tp model done: dtensor={_n_dtensor}, cuda_wrapped={_n_cuda}, cpu_skipped={_n_skip}, lora_sharded={_n_lora}", file=_sys.stderr, flush=True)
+
+        _n_models = sum(1 for a in result if isinstance(a, torch.nn.Module))
+        print(f"[DIAG rank={_rank}] _prepare_tp exit: {len(result)} args, {_n_models} models", file=_sys.stderr, flush=True)
         return args
 
     def _prepare_cp(self, *args):
@@ -1670,16 +1764,19 @@ class Accelerator:
         if model_index is None:
             return tuple(result)
 
-        # Register KT wrappers as ignored_modules for FSDP2
-        # The entire KTMoELayerWrapper should be skipped by FSDP (expert weights live in C++ kernel,
-        # lora_params are managed separately, _original_experts are CPU placeholders)
+        # Register KT expert modules as ignored_modules for FSDP2
+        # Only ignore the experts submodule (CPU-side, managed by KT kernel).
+        # The router (gate) and shared_experts remain FSDP2-managed so their
+        # gradients are properly all-reduced across ranks.
         kt_plugin = getattr(self.state, "kt_config", None)
         if kt_plugin is not None and kt_plugin.enabled and getattr(model, "_kt_wrappers", None) is not None:
             if self.state.fsdp_plugin.ignored_modules is None:
                 self.state.fsdp_plugin.ignored_modules = []
             for wrapper in model._kt_wrappers:
-                if wrapper not in self.state.fsdp_plugin.ignored_modules:
-                    self.state.fsdp_plugin.ignored_modules.append(wrapper)
+                experts_attr = getattr(wrapper, '_experts_attr', 'experts')
+                experts = getattr(wrapper, experts_attr, None)
+                if experts is not None and experts not in self.state.fsdp_plugin.ignored_modules:
+                    self.state.fsdp_plugin.ignored_modules.append(experts)
 
         # Needs to be done first, to make sure AC + fully_shard will work as expected
         self.state.fsdp_plugin.set_auto_wrap_policy(model)
@@ -1798,8 +1895,8 @@ class Accelerator:
                     f"KT plugin does not support distributed type {self.distributed_type}. "
                     f"Allowed: {kt_plugin.allowed_distributed_types}"
                 )
-            if self.parallelism_config and (self.parallelism_config.tp_enabled or self.parallelism_config.cp_enabled):
-                raise ValueError("KT plugin is incompatible with TP/CP parallelism in Accelerate.")
+            # KT is compatible with TP when using native TP (from_pretrained tp_plan="auto"):
+            # expert weights stay on CPU (handled by KT C++ kernel), non-expert weights are TP-sharded.
 
         # TODO: Look at enabling native TP training directly with a proper config
         if (
