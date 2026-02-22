@@ -279,6 +279,115 @@ def _kt_mem_log_wrapper(rank: int, tag: str, wrapper: Any, device: torch.device 
     _kt_mem_log(rank, tag, **merged)
 
 
+def _all_gather_qlens(local_qlen: int, device: torch.device, world_size: int) -> list[int]:
+    import torch.distributed as dist
+
+    local_qlen_t = torch.tensor([int(local_qlen)], device=device, dtype=torch.int64)
+    gathered = [torch.empty(1, device=device, dtype=torch.int64) for _ in range(world_size)]
+    dist.all_gather(gathered, local_qlen_t)
+    return [int(t.item()) for t in gathered]
+
+
+def _qlen_offsets(all_qlens: list[int]) -> list[int]:
+    offsets = [0]
+    for q in all_qlens:
+        offsets.append(offsets[-1] + int(q))
+    return offsets
+
+
+def _dist_gather_varlen_to_rank0(
+    local_tensor: torch.Tensor,
+    *,
+    all_qlens: list[int],
+    rank: int,
+    world_size: int,
+) -> list[torch.Tensor] | None:
+    import torch.distributed as dist
+
+    local_tensor = local_tensor.contiguous()
+    local_expected = int(all_qlens[rank])
+    if local_tensor.shape[0] != local_expected:
+        raise RuntimeError(
+            f"Local leading dim mismatch on rank {rank}: got {local_tensor.shape[0]}, expected {local_expected}"
+        )
+
+    if rank == 0:
+        gathered: list[torch.Tensor | None] = [None] * world_size
+        gathered[0] = local_tensor
+        ops: list[dist.P2POp] = []
+        for src in range(1, world_size):
+            qlen_src = int(all_qlens[src])
+            recv_shape = (qlen_src, *local_tensor.shape[1:])
+            recv = torch.empty(recv_shape, device=local_tensor.device, dtype=local_tensor.dtype)
+            gathered[src] = recv
+            if qlen_src > 0:
+                ops.append(dist.P2POp(dist.irecv, recv, src))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+        out: list[torch.Tensor] = []
+        for idx, t in enumerate(gathered):
+            if t is None:
+                raise RuntimeError(f"Missing gathered tensor for rank {idx} on rank0.")
+            out.append(t)
+        return out
+
+    if local_expected > 0:
+        reqs = dist.batch_isend_irecv([dist.P2POp(dist.isend, local_tensor, 0)])
+        for req in reqs:
+            req.wait()
+    return None
+
+
+def _dist_scatter_varlen_from_rank0(
+    *,
+    rank0_chunks: list[torch.Tensor] | None,
+    all_qlens: list[int],
+    rank: int,
+    world_size: int,
+    feature_shape: tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    import torch.distributed as dist
+
+    local_qlen = int(all_qlens[rank])
+    local_out = torch.empty((local_qlen, *feature_shape), device=device, dtype=dtype)
+
+    if rank == 0:
+        if rank0_chunks is None or len(rank0_chunks) != world_size:
+            raise RuntimeError("rank0_chunks must contain one chunk per rank on rank0.")
+        if int(rank0_chunks[0].shape[0]) != local_qlen:
+            raise RuntimeError(
+                f"Rank0 local chunk mismatch: got {rank0_chunks[0].shape[0]}, expected {local_qlen}"
+            )
+        if local_qlen > 0:
+            local_out.copy_(rank0_chunks[0])
+        ops: list[dist.P2POp] = []
+        for dst in range(1, world_size):
+            qlen_dst = int(all_qlens[dst])
+            if qlen_dst <= 0:
+                continue
+            chunk = rank0_chunks[dst].contiguous()
+            if int(chunk.shape[0]) != qlen_dst:
+                raise RuntimeError(
+                    f"Rank{dst} chunk mismatch on rank0: got {chunk.shape[0]}, expected {qlen_dst}"
+                )
+            ops.append(dist.P2POp(dist.isend, chunk, dst))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+        return local_out
+
+    if local_qlen > 0:
+        reqs = dist.batch_isend_irecv([dist.P2POp(dist.irecv, local_out, 0)])
+        for req in reqs:
+            req.wait()
+    return local_out
+
+
 def _is_in_checkpoint_first_forward() -> bool:
     """Best-effort detection for non-reentrant checkpoint first forward.
 
@@ -1396,7 +1505,7 @@ class KTMoEFunction(torch.autograd.Function):
         layer_idx: int,
         training: bool,
         train_lora: bool,
-        qlen_max: int,
+        all_qlens: list[int] | tuple[int, ...] | None,
     ) -> torch.Tensor:
 
         original_device = hidden_states.device
@@ -1437,7 +1546,21 @@ class KTMoEFunction(torch.autograd.Function):
 
         # ---- Sync CPU expert result and distribute ----
         if dist_on:
-            # Rank 0: sync CPU result and scatter to all ranks
+            if all_qlens is None:
+                all_qlens_list = _all_gather_qlens(qlen, original_device, world_size)
+            else:
+                all_qlens_list = [int(q) for q in all_qlens]
+                if len(all_qlens_list) != world_size:
+                    raise RuntimeError(
+                        f"all_qlens length mismatch: got {len(all_qlens_list)}, expected {world_size}"
+                    )
+            if int(all_qlens_list[rank]) != qlen:
+                raise RuntimeError(
+                    f"Rank {rank} qlen mismatch: local={qlen}, all_qlens[{rank}]={all_qlens_list[rank]}"
+                )
+            total_qlen = sum(all_qlens_list)
+
+            # Rank 0: sync CPU result and split by real lengths
             if rank == 0:
                 if KT_MEM_LOG:
                     _kt_mem_log_wrapper(
@@ -1448,15 +1571,15 @@ class KTMoEFunction(torch.autograd.Function):
                         layer=layer_idx,
                     )
                 cpu_output = wrapper.sync_forward_sft(output_device=original_device)
-                cpu_output = cpu_output.to(dtype=original_dtype)
+                cpu_output = cpu_output.to(dtype=original_dtype).view(total_qlen, hidden_size)
                 _track_lifecycle_tensor(
                     rank,
                     layer_idx,
                     "autograd.rank0.cpu_output",
                     cpu_output,
                 )
-                scatter_list = list(cpu_output.view(world_size, qlen_max, hidden_size).unbind(0))
-                scatter_list = [c.contiguous() for c in scatter_list]
+                offsets = _qlen_offsets(all_qlens_list)
+                scatter_list = [cpu_output[offsets[i] : offsets[i + 1]].contiguous() for i in range(world_size)]
                 _track_lifecycle_collection(
                     rank,
                     layer_idx,
@@ -1471,27 +1594,34 @@ class KTMoEFunction(torch.autograd.Function):
                         device=original_device if original_device.type == "cuda" else None,
                         layer=layer_idx,
                         cpu_output_bytes=_tensor_nbytes(cpu_output),
+                        total_qlen=total_qlen,
                     )
             else:
                 scatter_list = None
 
-            output_padded = torch.empty(qlen_max, hidden_size, device=original_device, dtype=original_dtype)
+            output_flat = _dist_scatter_varlen_from_rank0(
+                rank0_chunks=scatter_list,
+                all_qlens=all_qlens_list,
+                rank=rank,
+                world_size=world_size,
+                feature_shape=(hidden_size,),
+                device=original_device,
+                dtype=original_dtype,
+            )
             _track_lifecycle_tensor(
                 rank,
                 layer_idx,
-                "autograd.output_padded",
-                output_padded,
+                "autograd.output_flat",
+                output_flat,
             )
-            dist.scatter(output_padded, scatter_list, src=0)
-            # clone() breaks the view alias so the padded base tensor can be freed.
-            output = output_padded[:qlen].clone().view(batch_size, seq_len, hidden_size)
+            output = output_flat.view(batch_size, seq_len, hidden_size)
             _track_lifecycle_tensor(
                 rank,
                 layer_idx,
                 "autograd.output",
                 output,
             )
-            del output_padded
+            del output_flat
         elif wrapper is not None:
             # Single-GPU: sync directly
             if KT_MEM_LOG:
@@ -1543,6 +1673,7 @@ class KTMoEFunction(torch.autograd.Function):
         ctx.weights_device = topk_weights.device
         ctx.dist_on = dist_on
         ctx.world_size = world_size
+        ctx.all_qlens = all_qlens_list if dist_on else None
         ctx.num_experts_per_tok = num_experts_per_tok
         ctx.layer_idx = layer_idx
 
@@ -1579,61 +1710,45 @@ class KTMoEFunction(torch.autograd.Function):
             _ctx_backward_enter(rank, layer=getattr(ctx, "layer_idx", -1), ctx_uid=ctx_uid)
 
         if dist_on:
-            # ---- Data-parallel gather/scatter backward ----
-            # Both batch_size and seq_len may differ across ranks.
+            all_qlens = getattr(ctx, "all_qlens", None)
+            if all_qlens is None or len(all_qlens) != world_size:
+                all_qlens = _all_gather_qlens(qlen, ctx.original_device, world_size)
+            else:
+                all_qlens = [int(q) for q in all_qlens]
+            if int(all_qlens[rank]) != qlen:
+                raise RuntimeError(
+                    f"Backward qlen mismatch on rank {rank}: local={qlen}, all_qlens[{rank}]={all_qlens[rank]}"
+                )
 
-            # 1. Exchange qlen from each rank
-            local_qlen_t = torch.tensor([qlen], device=ctx.original_device, dtype=torch.int64)
-            all_qlen_t = [torch.empty(1, device=ctx.original_device, dtype=torch.int64) for _ in range(world_size)]
-            dist.all_gather(all_qlen_t, local_qlen_t)
-            qlen_max = max(q.item() for q in all_qlen_t)
-
-            # 2. Flatten grad_output to [qlen, H] and pad to [qlen_max, H]
-            def _pad_flat(t, target_len, cur_len):
-                if cur_len == target_len:
-                    return t.contiguous()
-                pad_shape = list(t.shape)
-                pad_shape[0] = target_len - cur_len
-                return torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0).contiguous()
-
-            grad_out_flat = grad_output.view(qlen, hidden_size)
+            grad_out_flat = grad_output.view(qlen, hidden_size).contiguous()
             _track_lifecycle_tensor(
                 rank,
                 getattr(ctx, "layer_idx", -1),
                 "autograd.backward.grad_out_flat",
                 grad_out_flat,
             )
-            grad_out_padded = _pad_flat(grad_out_flat, qlen_max, qlen)  # [qlen_max, H]
-            _track_lifecycle_tensor(
-                rank,
-                getattr(ctx, "layer_idx", -1),
-                "autograd.backward.grad_out_padded",
-                grad_out_padded,
-            )
 
-            # 3. Gather on rank 0
+            gathered_go = _dist_gather_varlen_to_rank0(
+                grad_out_flat,
+                all_qlens=all_qlens,
+                rank=rank,
+                world_size=world_size,
+            )
             if rank == 0:
-                gathered_go = [torch.empty_like(grad_out_padded) for _ in range(world_size)]
                 _track_lifecycle_collection(
                     rank,
                     getattr(ctx, "layer_idx", -1),
                     "autograd.backward.gathered_go",
                     gathered_go,
                 )
-            else:
-                gathered_go = None
-            dist.gather(grad_out_padded, gathered_go, dst=0)
-
-            # 4. Rank 0: run backward on full gathered batch
-            if rank == 0:
-                all_go = torch.cat(gathered_go, dim=0)  # [qlen_max*W, H]
+                all_go = torch.cat(gathered_go, dim=0)
                 _track_lifecycle_tensor(
                     rank,
                     getattr(ctx, "layer_idx", -1),
                     "autograd.backward.rank0.all_go",
                     all_go,
                 )
-                total_qlen = qlen_max * world_size
+                total_qlen = int(all_go.shape[0])
 
                 if KT_MEM_LOG:
                     _kt_mem_log_wrapper(
@@ -1666,9 +1781,8 @@ class KTMoEFunction(torch.autograd.Function):
                         grad_weights_bytes=_tensor_nbytes(all_grad_weights),
                     )
 
-                # all_grad_input: [total_qlen, H], all_grad_weights: [total_qlen, K]
-                all_grad_input = all_grad_input.to(dtype=ctx.original_dtype)
-                all_grad_weights = all_grad_weights.to(dtype=torch.bfloat16)
+                all_grad_input = all_grad_input.to(dtype=ctx.original_dtype).view(total_qlen, hidden_size)
+                all_grad_weights = all_grad_weights.to(dtype=torch.bfloat16).view(total_qlen, num_experts_per_tok)
                 _track_lifecycle_tensor(
                     rank,
                     getattr(ctx, "layer_idx", -1),
@@ -1676,10 +1790,9 @@ class KTMoEFunction(torch.autograd.Function):
                     all_grad_input,
                 )
 
-                scatter_gi = list(all_grad_input.view(world_size, qlen_max, -1).unbind(0))
-                scatter_gi = [c.contiguous() for c in scatter_gi]
-                scatter_gw = list(all_grad_weights.view(world_size, qlen_max, -1).unbind(0))
-                scatter_gw = [c.contiguous() for c in scatter_gw]
+                offsets = _qlen_offsets(all_qlens)
+                scatter_gi = [all_grad_input[offsets[i] : offsets[i + 1]].contiguous() for i in range(world_size)]
+                scatter_gw = [all_grad_weights[offsets[i] : offsets[i + 1]].contiguous() for i in range(world_size)]
                 _track_lifecycle_collection(
                     rank,
                     getattr(ctx, "layer_idx", -1),
@@ -1696,25 +1809,38 @@ class KTMoEFunction(torch.autograd.Function):
                 scatter_gi = None
                 scatter_gw = None
 
-            # 5. Scatter back and trim to local qlen
-            gi_padded = torch.empty(qlen_max, hidden_size, device=ctx.original_device, dtype=ctx.original_dtype)
-            gw_padded = torch.empty(qlen_max, num_experts_per_tok, device=ctx.weights_device, dtype=torch.bfloat16)
-            _track_lifecycle_tensor(
-                rank,
-                getattr(ctx, "layer_idx", -1),
-                "autograd.backward.gi_padded",
-                gi_padded,
+            grad_input_flat = _dist_scatter_varlen_from_rank0(
+                rank0_chunks=scatter_gi,
+                all_qlens=all_qlens,
+                rank=rank,
+                world_size=world_size,
+                feature_shape=(hidden_size,),
+                device=ctx.original_device,
+                dtype=ctx.original_dtype,
+            )
+            grad_weights_flat = _dist_scatter_varlen_from_rank0(
+                rank0_chunks=scatter_gw,
+                all_qlens=all_qlens,
+                rank=rank,
+                world_size=world_size,
+                feature_shape=(num_experts_per_tok,),
+                device=ctx.weights_device,
+                dtype=torch.bfloat16,
             )
             _track_lifecycle_tensor(
                 rank,
                 getattr(ctx, "layer_idx", -1),
-                "autograd.backward.gw_padded",
-                gw_padded,
+                "autograd.backward.grad_input_flat",
+                grad_input_flat,
             )
-            dist.scatter(gi_padded, scatter_gi, src=0)
-            dist.scatter(gw_padded, scatter_gw, src=0)
-            grad_input = gi_padded[:qlen].view(batch_size, seq_len, hidden_size)
-            grad_weights = gw_padded[:qlen].view(ctx.weights_shape).to(dtype=ctx.weights_dtype)
+            _track_lifecycle_tensor(
+                rank,
+                getattr(ctx, "layer_idx", -1),
+                "autograd.backward.grad_weights_flat",
+                grad_weights_flat,
+            )
+            grad_input = grad_input_flat.view(batch_size, seq_len, hidden_size)
+            grad_weights = grad_weights_flat.view(ctx.weights_shape).to(dtype=ctx.weights_dtype)
             _track_lifecycle_tensor(
                 rank,
                 getattr(ctx, "layer_idx", -1),
@@ -2043,7 +2169,7 @@ class KTMoELayerWrapper(nn.Module):
                 self.layer_idx,
             )
 
-        gpu_output, qlen_max = self._submit_and_compute_gpu(
+        gpu_output, all_qlens = self._submit_and_compute_gpu(
             hidden_states,
             topk_ids,
             topk_weights,
@@ -2057,10 +2183,10 @@ class KTMoELayerWrapper(nn.Module):
         )
         if KT_DEBUG:
             logger.warning(
-                "[KT DEBUG] rank %s KTMoELayerWrapper.forward submit+gpu done layer=%s qlen_max=%s",
+                "[KT DEBUG] rank %s KTMoELayerWrapper.forward submit+gpu done layer=%s all_qlens=%s",
                 rank,
                 self.layer_idx,
-                qlen_max,
+                all_qlens,
             )
 
         # Use KTMoEFunction whenever backward is needed so KT backward and LoRA
@@ -2087,12 +2213,12 @@ class KTMoELayerWrapper(nn.Module):
                 self.layer_idx,
                 save_for_backward,
                 train_lora,
-                qlen_max,
+                all_qlens,
             )
         else:
             moe_output = self._sync_forward_output_no_autograd(
                 hidden_states=hidden_states,
-                qlen_max=qlen_max,
+                all_qlens=all_qlens,
             )
         _track_lifecycle_tensor(
             rank,
@@ -2147,7 +2273,7 @@ class KTMoELayerWrapper(nn.Module):
     def _sync_forward_output_no_autograd(
         self,
         hidden_states: torch.Tensor,
-        qlen_max: int,
+        all_qlens: list[int] | tuple[int, ...] | None,
     ) -> torch.Tensor:
         """Sync CPU expert output without creating KTMoEFunction autograd nodes."""
         import torch.distributed as dist
@@ -2162,19 +2288,33 @@ class KTMoELayerWrapper(nn.Module):
         world_size = dist.get_world_size() if dist_on else 1
 
         if dist_on:
+            if all_qlens is None:
+                all_qlens_list = _all_gather_qlens(qlen, original_device, world_size)
+            else:
+                all_qlens_list = [int(q) for q in all_qlens]
+                if len(all_qlens_list) != world_size:
+                    raise RuntimeError(
+                        f"all_qlens length mismatch: got {len(all_qlens_list)}, expected {world_size}"
+                    )
+            if int(all_qlens_list[rank]) != qlen:
+                raise RuntimeError(
+                    f"Rank {rank} qlen mismatch: local={qlen}, all_qlens[{rank}]={all_qlens_list[rank]}"
+                )
+            total_qlen = sum(all_qlens_list)
+
             if rank == 0:
                 if self.wrapper is None:
                     raise RuntimeError("Rank0 wrapper is required in distributed KT overlap path.")
                 cpu_output = self.wrapper.sync_forward_sft(output_device=original_device)
-                cpu_output = cpu_output.to(dtype=original_dtype)
+                cpu_output = cpu_output.to(dtype=original_dtype).view(total_qlen, self.hidden_size)
                 _track_lifecycle_tensor(
                     rank,
                     self.layer_idx,
                     "no_autograd.rank0.cpu_output",
                     cpu_output,
                 )
-                scatter_list = list(cpu_output.view(world_size, qlen_max, self.hidden_size).unbind(0))
-                scatter_list = [c.contiguous() for c in scatter_list]
+                offsets = _qlen_offsets(all_qlens_list)
+                scatter_list = [cpu_output[offsets[i] : offsets[i + 1]].contiguous() for i in range(world_size)]
                 _track_lifecycle_collection(
                     rank,
                     self.layer_idx,
@@ -2184,22 +2324,29 @@ class KTMoELayerWrapper(nn.Module):
             else:
                 scatter_list = None
 
-            output_padded = torch.empty(qlen_max, self.hidden_size, device=original_device, dtype=original_dtype)
+            output_flat = _dist_scatter_varlen_from_rank0(
+                rank0_chunks=scatter_list,
+                all_qlens=all_qlens_list,
+                rank=rank,
+                world_size=world_size,
+                feature_shape=(self.hidden_size,),
+                device=original_device,
+                dtype=original_dtype,
+            )
             _track_lifecycle_tensor(
                 rank,
                 self.layer_idx,
-                "no_autograd.output_padded",
-                output_padded,
+                "no_autograd.output_flat",
+                output_flat,
             )
-            dist.scatter(output_padded, scatter_list, src=0)
-            output = output_padded[:qlen].clone().view(batch_size, seq_len, self.hidden_size)
+            output = output_flat.view(batch_size, seq_len, self.hidden_size)
             _track_lifecycle_tensor(
                 rank,
                 self.layer_idx,
                 "no_autograd.output",
                 output,
             )
-            del output_padded
+            del output_flat
             return output
 
         if self.wrapper is not None:
@@ -2260,7 +2407,7 @@ class KTMoELayerWrapper(nn.Module):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         save_for_backward: bool,
-    ) -> tuple[torch.Tensor | None, int]:
+    ) -> tuple[torch.Tensor | None, list[int] | None]:
         import torch.distributed as dist
         
 
@@ -2287,94 +2434,65 @@ class KTMoELayerWrapper(nn.Module):
             )
 
         if dist_on:
-            # ---- Gather inputs from all ranks before submitting CPU work ----
-            local_qlen_t = torch.tensor([qlen], device=original_device, dtype=torch.int64)
-            all_qlen_t = [torch.empty(1, device=original_device, dtype=torch.int64) for _ in range(world_size)]
-            dist.all_gather(all_qlen_t, local_qlen_t)
-            qlen_max = max(q.item() for q in all_qlen_t)
+            all_qlens = _all_gather_qlens(qlen, original_device, world_size)
+            if int(all_qlens[rank]) != qlen:
+                raise RuntimeError(
+                    f"Rank {rank} qlen mismatch: local={qlen}, all_qlens[{rank}]={all_qlens[rank]}"
+                )
+            total_qlen = sum(all_qlens)
 
-            def _pad_flat(t, target_len, cur_len):
-                if cur_len == target_len:
-                    return t.contiguous()
-                pad_shape = list(t.shape)
-                pad_shape[0] = target_len - cur_len
-                return torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0).contiguous()
-
-            hs_flat = hidden_states.view(qlen, self.hidden_size)      # [qlen, H]
+            hs_flat = hidden_states.view(qlen, self.hidden_size).contiguous()
+            expert_ids = topk_ids.view(qlen, self.moe_config.num_experts_per_tok).contiguous()
+            weights = topk_weights.view(qlen, self.moe_config.num_experts_per_tok).contiguous()
             _track_lifecycle_tensor(
                 rank,
                 self.layer_idx,
                 "overlap.hs_flat",
                 hs_flat,
             )
-            hs_padded = _pad_flat(hs_flat, qlen_max, qlen)            # [qlen_max, H]
-            ids_padded = _pad_flat(topk_ids, qlen_max, qlen)
-            wts_padded = _pad_flat(topk_weights, qlen_max, qlen)
             _track_lifecycle_tensor(
                 rank,
                 self.layer_idx,
-                "overlap.hs_padded",
-                hs_padded,
+                "overlap.expert_ids",
+                expert_ids,
             )
             _track_lifecycle_tensor(
                 rank,
                 self.layer_idx,
-                "overlap.ids_padded",
-                ids_padded,
+                "overlap.weights",
+                weights,
             )
-            _track_lifecycle_tensor(
-                rank,
-                self.layer_idx,
-                "overlap.wts_padded",
-                wts_padded,
-            )
-            if KT_MEM_LOG:
-                _kt_mem_log(
-                    rank,
-                    "overlap_padded",
-                    layer=self.layer_idx,
-                    qlen_max=qlen_max,
-                    hs_padded_bytes=_tensor_nbytes(hs_padded),
-                    ids_padded_bytes=_tensor_nbytes(ids_padded),
-                    wts_padded_bytes=_tensor_nbytes(wts_padded),
-                )
 
-            # All_gather for hidden_states (needed by both CPU experts and shared_experts).
-            from torch.distributed.nn.functional import all_gather as diff_all_gather
-            all_hs_list = diff_all_gather(hs_padded)  # list of [qlen_max, H] with autograd
-            _track_lifecycle_collection(
-                rank,
-                self.layer_idx,
-                "overlap.all_hs_list",
-                all_hs_list,
-            )
-            all_hs_list_bytes = _tensor_nbytes(all_hs_list)
-            all_hs = torch.cat(all_hs_list, dim=0)    # [qlen_max*W, H]
-            _track_lifecycle_tensor(
-                rank,
-                self.layer_idx,
-                "overlap.all_hs",
-                all_hs,
-            )
-            total_qlen = qlen_max * world_size
+            submit_hs = hs_flat.detach()
+            submit_ids = expert_ids.detach()
+            submit_wts = weights.detach()
 
-            if KT_MEM_LOG and hidden_states.is_cuda:
-                _kt_mem_log(
-                    rank,
-                    "overlap_all_hs",
-                    layer=self.layer_idx,
-                    total_qlen=total_qlen,
-                    all_hs_list_bytes=all_hs_list_bytes,
-                    all_hs_bytes=_tensor_nbytes(all_hs),
-                    mem_allocated_bytes=torch.cuda.memory_allocated(hidden_states.device),
-                    mem_reserved_bytes=torch.cuda.memory_reserved(hidden_states.device),
-                    mem_max_allocated_bytes=torch.cuda.max_memory_allocated(hidden_states.device),
-                )
+            gathered_hs = _dist_gather_varlen_to_rank0(
+                submit_hs,
+                all_qlens=all_qlens,
+                rank=rank,
+                world_size=world_size,
+            )
+            gathered_ids = _dist_gather_varlen_to_rank0(
+                submit_ids,
+                all_qlens=all_qlens,
+                rank=rank,
+                world_size=world_size,
+            )
+            gathered_wts = _dist_gather_varlen_to_rank0(
+                submit_wts,
+                all_qlens=all_qlens,
+                rank=rank,
+                world_size=world_size,
+            )
 
-            # Gather ids/wts to rank 0 only (no grad needed, only rank 0 uses them for CPU experts)
             if rank == 0:
-                gathered_ids = [torch.empty_like(ids_padded) for _ in range(world_size)]
-                gathered_wts = [torch.empty_like(wts_padded) for _ in range(world_size)]
+                _track_lifecycle_collection(
+                    rank,
+                    self.layer_idx,
+                    "overlap.rank0.gathered_hs",
+                    gathered_hs,
+                )
                 _track_lifecycle_collection(
                     rank,
                     self.layer_idx,
@@ -2387,16 +2505,15 @@ class KTMoELayerWrapper(nn.Module):
                     "overlap.rank0.gathered_wts",
                     gathered_wts,
                 )
-            else:
-                gathered_ids = gathered_wts = None
-
-            dist.gather(ids_padded, gathered_ids, dst=0)
-            dist.gather(wts_padded, gathered_wts, dst=0)
-
-            # Rank 0: submit async CPU expert work on gathered full batch
-            if rank == 0:
-                all_ids = torch.cat(gathered_ids, dim=0)  # [qlen_max*W, K]
-                all_wts = torch.cat(gathered_wts, dim=0)  # [qlen_max*W, K]
+                all_hs = torch.cat(gathered_hs, dim=0)
+                all_ids = torch.cat(gathered_ids, dim=0)
+                all_wts = torch.cat(gathered_wts, dim=0)
+                _track_lifecycle_tensor(
+                    rank,
+                    self.layer_idx,
+                    "overlap.rank0.all_hs",
+                    all_hs,
+                )
                 _track_lifecycle_tensor(
                     rank,
                     self.layer_idx,
@@ -2414,8 +2531,11 @@ class KTMoELayerWrapper(nn.Module):
                         rank,
                         "overlap_rank0_gathered",
                         layer=self.layer_idx,
+                        total_qlen=total_qlen,
+                        gathered_hs_bytes=_tensor_nbytes(gathered_hs),
                         gathered_ids_bytes=_tensor_nbytes(gathered_ids),
                         gathered_wts_bytes=_tensor_nbytes(gathered_wts),
+                        all_hs_bytes=_tensor_nbytes(all_hs),
                         all_ids_bytes=_tensor_nbytes(all_ids),
                         all_wts_bytes=_tensor_nbytes(all_wts),
                     )
@@ -2427,12 +2547,12 @@ class KTMoELayerWrapper(nn.Module):
                         layer=self.layer_idx,
                         qlen=total_qlen,
                         save_for_backward=save_for_backward,
-                        all_hs_bytes=_tensor_nbytes(all_hs),
-                        all_ids_bytes=_tensor_nbytes(all_ids),
-                        all_wts_bytes=_tensor_nbytes(all_wts),
                     )
                 self.wrapper.submit_forward_sft(
-                    all_hs.detach(), all_ids.detach(), all_wts.detach(), save_for_backward=save_for_backward
+                    all_hs,
+                    all_ids,
+                    all_wts,
+                    save_for_backward=save_for_backward,
                 )
                 if KT_MEM_LOG:
                     _kt_mem_log_wrapper(
@@ -2444,33 +2564,17 @@ class KTMoELayerWrapper(nn.Module):
                         save_for_backward=save_for_backward,
                     )
 
-            # All ranks compute shared_experts on the SAME gathered input concurrently
-            # with CPU expert work. FSDP2-wrapped shared_experts requires all ranks to
-            # participate. Identical input ensures identical output, eliminating precision
-            # differences from per-rank input divergence.
+            # Keep shared/lora experts local to avoid qlen_max-style amplification.
             gpu_output = None
             if self.shared_experts is not None:
-                all_shared_out = self.shared_experts(
-                    all_hs.view(1, total_qlen, self.hidden_size)
-                )
+                gpu_output = self.shared_experts(hidden_states)
                 _track_lifecycle_tensor(
                     rank,
                     self.layer_idx,
-                    "overlap.all_shared_out",
-                    all_shared_out,
-                )
-                all_shared_out = all_shared_out.to(dtype=original_dtype)
-                # Each rank takes its own slice; clone() breaks the view alias so
-                # the large all_shared_out base tensor can be freed immediately.
-                all_shared_out = all_shared_out.view(world_size, qlen_max, self.hidden_size)
-                gpu_output = all_shared_out[rank, :qlen].clone().view(batch_size, seq_len, self.hidden_size)
-                _track_lifecycle_tensor(
-                    rank,
-                    self.layer_idx,
-                    "overlap.shared_slice_gpu_output",
+                    "overlap.shared_gpu_output",
                     gpu_output,
                 )
-                del all_shared_out
+                gpu_output = gpu_output.to(dtype=original_dtype)
 
             if self.lora_experts is not None:
                 lora_out = self.lora_experts(hidden_states)
@@ -2482,7 +2586,7 @@ class KTMoELayerWrapper(nn.Module):
                 )
                 gpu_output = lora_out if gpu_output is None else gpu_output + lora_out
 
-            return gpu_output, qlen_max
+            return gpu_output, all_qlens
 
         else:
             # ---- Single-GPU path: submit + GPU compute ----
@@ -2558,7 +2662,7 @@ class KTMoELayerWrapper(nn.Module):
                 )
                 gpu_output = lora_out if gpu_output is None else gpu_output + lora_out
 
-            return gpu_output, qlen
+            return gpu_output, None
 
     def update_lora_pointers(self):
         """Sync PEFT LoRA weights to C++ kernel after optimizer update."""
