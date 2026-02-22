@@ -2828,6 +2828,7 @@ class KTransformersPlugin:
     kt_threadpool_count: int | None = None
     kt_max_cache_depth: int | None = None
     kt_weight_path: str | None = None
+    kt_expert_checkpoint_path: str | None = None
     kt_use_lora_experts: bool | None = None
     kt_lora_expert_num: int | None = None
     kt_lora_expert_intermediate_size: int | None = None
@@ -2882,6 +2883,9 @@ class KTransformersPlugin:
 
         if self.kt_weight_path is None:
             self.kt_weight_path = os.environ.get("ACCELERATE_KT_WEIGHT_PATH", None)
+
+        if self.kt_expert_checkpoint_path is None:
+            self.kt_expert_checkpoint_path = os.environ.get("ACCELERATE_KT_EXPERT_CHECKPOINT_PATH", None)
 
         if self.kt_use_lora_experts is None:
             self.kt_use_lora_experts = parse_flag_from_env("ACCELERATE_KT_USE_LORA_EXPERTS", default=False)

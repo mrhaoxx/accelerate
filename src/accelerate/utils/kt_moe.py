@@ -20,12 +20,16 @@ from __future__ import annotations
 
 import gc
 import importlib.util as _u
+import inspect
 import math
 import os
+import weakref
 import time
+from datetime import datetime
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
+from threading import Lock
 
 import torch
 import torch.nn as nn
@@ -37,6 +41,18 @@ from .dataclasses import KTransformersPlugin
 
 logger = _logging.getLogger(__name__)
 KT_DEBUG = os.environ.get("ACCELERATE_KT_DEBUG", "0") == "1"
+KT_MEM_LOG = os.environ.get("ACCELERATE_KT_MEM_LOG", "0") == "1"
+KT_LIFECYCLE_LOG = os.environ.get("ACCELERATE_KT_LIFECYCLE_LOG", "0") == "1"
+KT_LIFECYCLE_REFERRERS = os.environ.get("ACCELERATE_KT_LIFECYCLE_REFERRERS", "0") == "1"
+
+_LIFECYCLE_LOCK = Lock()
+_LIFECYCLE_SEQ = 0
+_LIFECYCLE_BACKWARD_COUNT = 0
+_LIFECYCLE_TRACKED: dict[int, dict[str, Any]] = {}
+_CTX_SEQ = 0
+_CTX_LIVE: dict[int, dict[str, Any]] = {}
+_KT_MEM_LOG_LOCK = Lock()
+_KT_MEM_LOG_CLEARED_PATHS: set[str] = set()
 
 # Check if kt_kernel is available
 KT_KERNEL_AVAILABLE = _u.find_spec("kt_kernel") is not None
@@ -175,6 +191,390 @@ def get_moe_module(layer: nn.Module, moe_config: MOEArchConfig) -> nn.Module | N
     if not hasattr(moe_module, moe_config.experts_attr):
         return None
     return moe_module
+
+
+def _tensor_nbytes(obj: Any) -> int:
+    if torch.is_tensor(obj):
+        return obj.numel() * obj.element_size()
+    if isinstance(obj, (list, tuple)):
+        total = 0
+        for x in obj:
+            total += _tensor_nbytes(x)
+        return total
+    return 0
+
+
+def _kt_mem_log(rank: int, tag: str, **stats: Any) -> None:
+    if not KT_MEM_LOG:
+        return
+    path_tpl = os.environ.get("ACCELERATE_KT_MEM_LOG_FILE", "kt_mem_rank{rank}.log")
+    path = path_tpl.format(rank=rank)
+    try:
+        # Clear previous run log once per process/path so each launch starts fresh.
+        with _KT_MEM_LOG_LOCK:
+            if path not in _KT_MEM_LOG_CLEARED_PATHS:
+                with open(path, "w", encoding="utf-8"):
+                    pass
+                _KT_MEM_LOG_CLEARED_PATHS.add(path)
+        pieces: list[str] = []
+        for k, v in stats.items():
+            if isinstance(v, int) and ("bytes" in k or "nbytes" in k):
+                pieces.append(f"{k}={v/1024/1024:.2f}MB")
+            else:
+                pieces.append(f"{k}={v}")
+        line = (
+            f"{datetime.now().isoformat()} pid={os.getpid()} rank={rank} tag={tag} "
+            + " ".join(pieces)
+            + "\n"
+        )
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        return
+
+
+def _cuda_mem_stats(device: torch.device | None) -> dict[str, int]:
+    if device is None or device.type != "cuda" or not torch.cuda.is_available():
+        return {}
+    return {
+        "mem_allocated_bytes": torch.cuda.memory_allocated(device),
+        "mem_reserved_bytes": torch.cuda.memory_reserved(device),
+        "mem_max_allocated_bytes": torch.cuda.max_memory_allocated(device),
+    }
+
+
+def _wrapper_cache_stats(wrapper: Any) -> dict[str, Any]:
+    if wrapper is None:
+        return {"wrapper_present": False}
+
+    pending_buffer = getattr(wrapper, "_pending_buffer", None)
+    pending_qlen = getattr(wrapper, "_pending_qlen", None)
+    hidden_size = getattr(wrapper, "hidden_size", None)
+    num_experts_per_tok = getattr(wrapper, "num_experts_per_tok", None)
+
+    stats: dict[str, Any] = {
+        "wrapper_present": True,
+        "cache_depth": getattr(wrapper, "_cache_depth", None),
+        "max_cache_depth": getattr(wrapper, "max_cache_depth", None),
+        "pending_exists": pending_buffer is not None,
+        "pending_save_for_backward": getattr(wrapper, "_pending_save_for_backward", None),
+        "pending_qlen": pending_qlen,
+    }
+    if isinstance(pending_qlen, int) and isinstance(hidden_size, int):
+        stats["pending_input_bytes_est"] = pending_qlen * hidden_size * 2  # bf16
+        stats["pending_output_bytes_est"] = pending_qlen * hidden_size * 2  # bf16
+    if isinstance(pending_qlen, int) and isinstance(num_experts_per_tok, int):
+        stats["pending_expert_ids_bytes_est"] = pending_qlen * num_experts_per_tok * 8  # int64
+        stats["pending_weights_bytes_est"] = pending_qlen * num_experts_per_tok * 4  # float32
+    return stats
+
+
+def _kt_mem_log_wrapper(rank: int, tag: str, wrapper: Any, device: torch.device | None = None, **stats: Any) -> None:
+    if not KT_MEM_LOG:
+        return
+    merged: dict[str, Any] = {}
+    merged.update(_wrapper_cache_stats(wrapper))
+    merged.update(_cuda_mem_stats(device))
+    merged.update(stats)
+    _kt_mem_log(rank, tag, **merged)
+
+
+def _is_in_checkpoint_first_forward() -> bool:
+    """Best-effort detection for non-reentrant checkpoint first forward.
+
+    Recompute (during backward) does not traverse our Python GC wrapper call path,
+    while the first forward does.
+    """
+    try:
+        for frame_info in inspect.stack(context=0):
+            fn = frame_info.function
+            file = frame_info.filename or ""
+            # LLaMA-Factory GC wrapper (first forward only).
+            if fn == "custom_gradient_checkpointing_func" and file.endswith("checkpointing.py"):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _checkpoint_hook_mode() -> str:
+    """Infer checkpoint phase from current saved_tensors_hooks top.
+
+    Returns one of:
+      - "first_forward": non-reentrant checkpoint's _checkpoint_hook
+      - "recompute": non-reentrant checkpoint's _recomputation_hook
+      - "none": no default saved_tensors_hooks on top
+      - "other": unknown hook stack entry
+      - "error": failed to query hook stack
+    """
+    try:
+        top = torch._C._autograd._top_saved_tensors_default_hooks(False)
+    except Exception:
+        return "error"
+    if top is None:
+        return "none"
+    try:
+        pack_fn, _ = top
+        mod = getattr(pack_fn, "__module__", "")
+        qual = getattr(pack_fn, "__qualname__", getattr(pack_fn, "__name__", ""))
+        tag = f"{mod}.{qual}"
+    except Exception:
+        return "other"
+    if "_recomputation_hook.__init__.<locals>.pack_hook" in tag:
+        return "recompute"
+    if "_checkpoint_hook.__init__.<locals>.pack_hook" in tag:
+        return "first_forward"
+    return "other"
+
+
+def _lifecycle_referrer_types(obj: Any, limit: int = 6) -> list[str]:
+    if not KT_LIFECYCLE_REFERRERS:
+        return []
+    try:
+        ref_types: dict[str, int] = {}
+        for ref in gc.get_referrers(obj):
+            tname = type(ref).__name__
+            ref_types[tname] = ref_types.get(tname, 0) + 1
+        return [f"{k}:{v}" for k, v in sorted(ref_types.items(), key=lambda kv: kv[1], reverse=True)[:limit]]
+    except Exception:
+        return []
+
+
+def _lifecycle_finalize(tensor_id: int, rank: int, layer: int, label: str, seq: int, bytes_size: int) -> None:
+    with _LIFECYCLE_LOCK:
+        _LIFECYCLE_TRACKED.pop(tensor_id, None)
+    _kt_mem_log(
+        rank,
+        "lifecycle_release",
+        layer=layer,
+        label=label,
+        seq=seq,
+        tensor_id=tensor_id,
+        tensor_bytes=bytes_size,
+    )
+
+
+def _track_lifecycle_tensor(
+    rank: int,
+    layer: int,
+    label: str,
+    tensor: torch.Tensor | None,
+) -> None:
+    if not KT_LIFECYCLE_LOG:
+        return
+    if not torch.is_tensor(tensor):
+        return
+    if not tensor.is_cuda:
+        return
+    tensor_id = id(tensor)
+    tensor_bytes = _tensor_nbytes(tensor)
+    with _LIFECYCLE_LOCK:
+        global _LIFECYCLE_SEQ
+        _LIFECYCLE_SEQ += 1
+        seq = _LIFECYCLE_SEQ
+        finalizer = weakref.finalize(
+            tensor,
+            _lifecycle_finalize,
+            tensor_id,
+            rank,
+            layer,
+            label,
+            seq,
+            tensor_bytes,
+        )
+        _LIFECYCLE_TRACKED[tensor_id] = {
+            "seq": seq,
+            "rank": rank,
+            "layer": layer,
+            "label": label,
+            "bytes": tensor_bytes,
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "created_at": time.time(),
+            "weak": weakref.ref(tensor),
+            "finalizer": finalizer,
+        }
+    _kt_mem_log(
+        rank,
+        "lifecycle_track",
+        layer=layer,
+        label=label,
+        seq=seq,
+        tensor_id=tensor_id,
+        tensor_shape=tuple(tensor.shape),
+        tensor_dtype=str(tensor.dtype),
+        tensor_device=str(tensor.device),
+        tensor_bytes=tensor_bytes,
+    )
+
+
+def _track_lifecycle_collection(
+    rank: int,
+    layer: int,
+    label_prefix: str,
+    tensors: Any,
+    *,
+    max_items: int = 8,
+) -> None:
+    if not KT_LIFECYCLE_LOG:
+        return
+    if tensors is None:
+        return
+    if torch.is_tensor(tensors):
+        _track_lifecycle_tensor(rank, layer, label_prefix, tensors)
+        return
+    if not isinstance(tensors, (list, tuple)):
+        return
+    for i, t in enumerate(tensors):
+        if i >= max_items:
+            break
+        _track_lifecycle_tensor(rank, layer, f"{label_prefix}[{i}]", t)
+
+
+def _log_lifecycle_snapshot(rank: int, *, layer: int, tag: str, topk: int = 8) -> None:
+    if not KT_LIFECYCLE_LOG:
+        return
+    now = time.time()
+    with _LIFECYCLE_LOCK:
+        live = list(_LIFECYCLE_TRACKED.values())
+    if not live:
+        _kt_mem_log(rank, "lifecycle_snapshot", layer=layer, snapshot_tag=tag, live_count=0, live_bytes=0)
+        return
+
+    live_bytes = sum(entry["bytes"] for entry in live)
+    _kt_mem_log(
+        rank,
+        "lifecycle_snapshot",
+        layer=layer,
+        snapshot_tag=tag,
+        live_count=len(live),
+        live_bytes=live_bytes,
+    )
+
+    # Focus on largest and oldest live tensors to surface persistent holders.
+    ranked = sorted(live, key=lambda x: (x["bytes"], now - x["created_at"]), reverse=True)[:topk]
+    for entry in ranked:
+        age_s = max(0.0, now - entry["created_at"])
+        ref_types: list[str] = []
+        obj = entry["weak"]()
+        if obj is not None:
+            ref_types = _lifecycle_referrer_types(obj)
+        _kt_mem_log(
+            rank,
+            "lifecycle_live_tensor",
+            layer=entry["layer"],
+            label=entry["label"],
+            seq=entry["seq"],
+            tensor_bytes=entry["bytes"],
+            tensor_shape=entry["shape"],
+            tensor_dtype=entry["dtype"],
+            tensor_device=entry["device"],
+            age_s=round(age_s, 6),
+            referrer_types="|".join(ref_types) if ref_types else "",
+        )
+
+
+def _ctx_register(
+    rank: int,
+    *,
+    layer: int,
+    topk_ids_id: int,
+    topk_ids_shape: tuple[int, ...],
+    topk_ids_bytes: int,
+    topk_weights: torch.Tensor,
+) -> int:
+    with _LIFECYCLE_LOCK:
+        global _CTX_SEQ
+        _CTX_SEQ += 1
+        ctx_uid = _CTX_SEQ
+        _CTX_LIVE[ctx_uid] = {
+            "created_at": time.time(),
+            "layer": layer,
+            "topk_ids_id": topk_ids_id,
+            "topk_ids_shape": topk_ids_shape,
+            "topk_ids_bytes": topk_ids_bytes,
+            "topk_weights_id": id(topk_weights),
+            "topk_weights_bytes": _tensor_nbytes(topk_weights),
+        }
+    _kt_mem_log(
+        rank,
+        "ctx_forward",
+        ctx_uid=ctx_uid,
+        layer=layer,
+        topk_ids_id=topk_ids_id,
+        topk_ids_shape=topk_ids_shape,
+        topk_ids_bytes=topk_ids_bytes,
+        topk_weights_id=id(topk_weights),
+        topk_weights_shape=tuple(topk_weights.shape),
+        topk_weights_bytes=_tensor_nbytes(topk_weights),
+    )
+    return ctx_uid
+
+
+def _ctx_backward_enter(rank: int, *, layer: int, ctx_uid: int) -> None:
+    with _LIFECYCLE_LOCK:
+        entry = _CTX_LIVE.get(ctx_uid)
+    age_s = -1.0
+    if entry is not None:
+        age_s = max(0.0, time.time() - float(entry["created_at"]))
+    _kt_mem_log(
+        rank,
+        "ctx_backward_enter",
+        ctx_uid=ctx_uid,
+        layer=layer,
+        ctx_found=entry is not None,
+        age_s=round(age_s, 6),
+    )
+
+
+def _ctx_backward_exit(rank: int, *, layer: int, ctx_uid: int) -> None:
+    with _LIFECYCLE_LOCK:
+        entry = _CTX_LIVE.pop(ctx_uid, None)
+        live_count = len(_CTX_LIVE)
+    age_s = -1.0
+    if entry is not None:
+        age_s = max(0.0, time.time() - float(entry["created_at"]))
+    _kt_mem_log(
+        rank,
+        "ctx_backward_exit",
+        ctx_uid=ctx_uid,
+        layer=layer,
+        ctx_found=entry is not None,
+        age_s=round(age_s, 6),
+        live_ctx_count=live_count,
+    )
+
+
+def _ctx_snapshot(rank: int, *, layer: int, tag: str, topk: int = 8) -> None:
+    with _LIFECYCLE_LOCK:
+        live = list(_CTX_LIVE.items())
+    _kt_mem_log(
+        rank,
+        "ctx_snapshot",
+        layer=layer,
+        snapshot_tag=tag,
+        live_ctx_count=len(live),
+    )
+    if not live:
+        return
+    now = time.time()
+    ranked = sorted(live, key=lambda kv: now - float(kv[1]["created_at"]), reverse=True)[:topk]
+    for ctx_uid, entry in ranked:
+        age_s = max(0.0, now - float(entry["created_at"]))
+        _kt_mem_log(
+            rank,
+            "ctx_live",
+            ctx_uid=ctx_uid,
+            layer=entry["layer"],
+            age_s=round(age_s, 6),
+            topk_ids_id=entry["topk_ids_id"],
+            topk_ids_bytes=entry["topk_ids_bytes"],
+            topk_weights_id=entry["topk_weights_id"],
+            topk_weights_bytes=entry["topk_weights_bytes"],
+            precomputed_output_id=entry.get("precomputed_output_id", -1),
+            precomputed_output_bytes=entry.get("precomputed_output_bytes", 0),
+        )
 
 
 # =============================================================================
@@ -706,18 +1106,52 @@ def _resolve_checkpoint_files(
     return checkpoint_files, sharded_metadata
 
 
+def _dequant_fp8_experts(weights: list[torch.Tensor], scales: list[torch.Tensor | None], block_size: tuple[int, int]) -> torch.Tensor:
+    """Dequantize a list of FP8 expert weights and stack them (batched, vectorized).
+
+    Args:
+        weights: list of [out, in] float8_e4m3fn tensors (one per expert)
+        scales: list of [out//bs_m, in//bs_n] scale_inv tensors (one per expert, may be None)
+        block_size: (bs_m, bs_n)
+
+    Returns:
+        Stacked BF16 tensor of shape [num_experts, out, in]
+    """
+    has_scales = scales[0] is not None
+    if not has_scales:
+        return torch.stack(weights, dim=0).to(torch.bfloat16).cpu().contiguous()
+
+    bs_m, bs_n = block_size
+    n = len(weights)
+    out_features, in_features = weights[0].shape
+
+    # Stack all experts: [N, out, in] fp8 → reshape to blocks → bf16
+    w = torch.stack(weights, dim=0)  # [N, out, in] fp8
+    w = w.reshape(n, out_features // bs_m, bs_m, in_features // bs_n, bs_n)
+    w = w.to(torch.bfloat16)
+
+    # Stack all scales: [N, out//bs_m, in//bs_n] → bf16, broadcast multiply
+    s = torch.stack(scales, dim=0).to(torch.bfloat16)  # [N, out//bs_m, in//bs_n]
+    w = w * s[:, :, None, :, None]
+
+    return w.reshape(n, out_features, in_features).contiguous()
+
+
 def load_experts_from_checkpoint_files(
     checkpoint_files: list[str],
     sharded_metadata: dict | None,
     layers_prefix: str,
     moe_config: MOEArchConfig,
     layer_idx: int,
+    block_size: tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if not SAFETENSORS_AVAILABLE:
         raise ImportError("safetensors is required for loading experts from checkpoint files")
 
     if not checkpoint_files:
         raise FileNotFoundError("checkpoint_files is empty")
+
+    t0 = time.time()
 
     weight_map = None
     base_dir = os.path.dirname(checkpoint_files[0])
@@ -729,30 +1163,61 @@ def load_experts_from_checkpoint_files(
     for expert_idx in range(moe_config.expert_num):
         base = f"{layers_prefix}.{layer_idx}.{moe_config.moe_layer_attr}.{moe_config.experts_attr}.{expert_idx}"
         keys.append(f"{base}.{gate_name}.weight")
+        keys.append(f"{base}.{gate_name}.weight_scale_inv")
         keys.append(f"{base}.{up_name}.weight")
+        keys.append(f"{base}.{up_name}.weight_scale_inv")
         keys.append(f"{base}.{down_name}.weight")
+        keys.append(f"{base}.{down_name}.weight_scale_inv")
 
     keys_by_file: dict[str, list[str]] = {}
+    mapped_count = 0
+    unmapped_count = 0
     for key in keys:
         if weight_map is not None:
             filename = weight_map.get(key)
             if filename is None:
+                unmapped_count += 1
                 continue
+            mapped_count += 1
             file_path = os.path.join(base_dir, filename)
         else:
             file_path = checkpoint_files[0]
         keys_by_file.setdefault(file_path, []).append(key)
 
+    print(
+        f"[kt_moe] Layer {layer_idx}: key mapping done in {time.time()-t0:.1f}s — "
+        f"total_keys={len(keys)}, mapped={mapped_count}, unmapped={unmapped_count}, "
+        f"files_to_open={len(keys_by_file)}",
+        flush=True,
+    )
+
+    t1 = time.time()
     tensor_map: dict[str, torch.Tensor] = {}
-    for file_path, file_keys in keys_by_file.items():
+    for file_idx, (file_path, file_keys) in enumerate(keys_by_file.items()):
         with safe_open(file_path, framework="pt") as f:
+            available_keys = set(f.keys())
             for key in file_keys:
-                if key in f.keys():
+                if key in available_keys:
                     tensor_map[key] = f.get_tensor(key)
+        if file_idx == 0:
+            print(
+                f"[kt_moe] Layer {layer_idx}: first file loaded ({os.path.basename(file_path)}, "
+                f"{len(file_keys)} keys) in {time.time()-t1:.1f}s",
+                flush=True,
+            )
+
+    print(
+        f"[kt_moe] Layer {layer_idx}: all files loaded in {time.time()-t1:.1f}s — "
+        f"tensor_map has {len(tensor_map)} tensors",
+        flush=True,
+    )
 
     gate_weights = []
     up_weights = []
     down_weights = []
+    gate_scales = []
+    up_scales = []
+    down_scales = []
     for expert_idx in range(moe_config.expert_num):
         base = f"{layers_prefix}.{layer_idx}.{moe_config.moe_layer_attr}.{moe_config.experts_attr}.{expert_idx}"
         gate_key = f"{base}.{gate_name}.weight"
@@ -763,10 +1228,35 @@ def load_experts_from_checkpoint_files(
         gate_weights.append(tensor_map[gate_key])
         up_weights.append(tensor_map[up_key])
         down_weights.append(tensor_map[down_key])
+        gate_scales.append(tensor_map.get(f"{base}.{gate_name}.weight_scale_inv"))
+        up_scales.append(tensor_map.get(f"{base}.{up_name}.weight_scale_inv"))
+        down_scales.append(tensor_map.get(f"{base}.{down_name}.weight_scale_inv"))
 
-    gate_proj = torch.stack(gate_weights, dim=0).cpu().to(torch.bfloat16).contiguous()
-    up_proj = torch.stack(up_weights, dim=0).cpu().to(torch.bfloat16).contiguous()
-    down_proj = torch.stack(down_weights, dim=0).cpu().to(torch.bfloat16).contiguous()
+    # Check if weights are FP8 and need dequantization
+    t2 = time.time()
+    is_fp8 = gate_weights[0].dtype == torch.float8_e4m3fn
+    if is_fp8:
+        if block_size is None:
+            block_size = (128, 128)
+        print(
+            f"[kt_moe] Layer {layer_idx}: FP8 expert weights detected, "
+            f"dequantizing with block_size={block_size} "
+            f"(has_scales={gate_scales[0] is not None})",
+            flush=True,
+        )
+        gate_proj = _dequant_fp8_experts(gate_weights, gate_scales, block_size)
+        up_proj = _dequant_fp8_experts(up_weights, up_scales, block_size)
+        down_proj = _dequant_fp8_experts(down_weights, down_scales, block_size)
+    else:
+        gate_proj = torch.stack(gate_weights, dim=0).cpu().to(torch.bfloat16).contiguous()
+        up_proj = torch.stack(up_weights, dim=0).cpu().to(torch.bfloat16).contiguous()
+        down_proj = torch.stack(down_weights, dim=0).cpu().to(torch.bfloat16).contiguous()
+
+    print(
+        f"[kt_moe] Layer {layer_idx}: done — dtype={gate_proj.dtype}, shape={gate_proj.shape}, "
+        f"dequant={time.time()-t2:.1f}s, total={time.time()-t0:.1f}s",
+        flush=True,
+    )
     return gate_proj, up_proj, down_proj
 
 
@@ -900,17 +1390,15 @@ class KTMoEFunction(torch.autograd.Function):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         wrapper: Any,
-        peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]] | None,
         lora_ref: torch.Tensor,
         hidden_size: int,
         num_experts_per_tok: int,
         layer_idx: int,
         training: bool,
         train_lora: bool,
-        precomputed_output: torch.Tensor | None = None,
-        weight_names: tuple[str, str, str] | None = None,
+        qlen_max: int,
     ) -> torch.Tensor:
-        
+
         original_device = hidden_states.device
         original_dtype = hidden_states.dtype
         batch_size, seq_len, _ = hidden_states.shape
@@ -921,110 +1409,142 @@ class KTMoEFunction(torch.autograd.Function):
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist_on else 1
 
+        if KT_MEM_LOG:
+            _kt_mem_log_wrapper(
+                rank,
+                "autograd_forward_state",
+                wrapper,
+                device=original_device if original_device.type == "cuda" else None,
+                layer=layer_idx,
+                training=training,
+                train_lora=train_lora,
+                qlen=qlen,
+            )
+
+        if KT_LIFECYCLE_LOG and rank == 0:
+            ctx._kt_ctx_uid = _ctx_register(
+                rank,
+                layer=layer_idx,
+                topk_ids_id=id(topk_ids),
+                topk_ids_shape=tuple(topk_ids.shape),
+                topk_ids_bytes=_tensor_nbytes(topk_ids),
+                topk_weights=topk_weights,
+            )
+        else:
+            ctx._kt_ctx_uid = -1
+
         ctx.use_broadcast = wrapper is None
 
-        # if precomputed_output is not None:
-        output = precomputed_output
-        # elif dist_on:
-        #     # ---- Data-parallel gather/scatter path ----
-        #     # Each rank has its own batch. Gather all on rank 0, compute, scatter back.
-        #     # Both batch_size and seq_len may differ across ranks.
+        # ---- Sync CPU expert result and distribute ----
+        if dist_on:
+            # Rank 0: sync CPU result and scatter to all ranks
+            if rank == 0:
+                if KT_MEM_LOG:
+                    _kt_mem_log_wrapper(
+                        rank,
+                        "autograd_rank0_before_sync",
+                        wrapper,
+                        device=original_device if original_device.type == "cuda" else None,
+                        layer=layer_idx,
+                    )
+                cpu_output = wrapper.sync_forward_sft(output_device=original_device)
+                cpu_output = cpu_output.to(dtype=original_dtype)
+                _track_lifecycle_tensor(
+                    rank,
+                    layer_idx,
+                    "autograd.rank0.cpu_output",
+                    cpu_output,
+                )
+                scatter_list = list(cpu_output.view(world_size, qlen_max, hidden_size).unbind(0))
+                scatter_list = [c.contiguous() for c in scatter_list]
+                _track_lifecycle_collection(
+                    rank,
+                    layer_idx,
+                    "autograd.rank0.scatter_list",
+                    scatter_list,
+                )
+                if KT_MEM_LOG:
+                    _kt_mem_log_wrapper(
+                        rank,
+                        "autograd_rank0_after_sync",
+                        wrapper,
+                        device=original_device if original_device.type == "cuda" else None,
+                        layer=layer_idx,
+                        cpu_output_bytes=_tensor_nbytes(cpu_output),
+                    )
+            else:
+                scatter_list = None
 
-        #     # 1. Exchange qlen from each rank
-        #     local_qlen_t = torch.tensor([qlen], device=original_device, dtype=torch.int64)
-        #     all_qlen_t = [torch.empty(1, device=original_device, dtype=torch.int64) for _ in range(world_size)]
-        #     dist.all_gather(all_qlen_t, local_qlen_t)
-        #     qlen_max = max(q.item() for q in all_qlen_t)
-
-        #     # 2. Flatten everything to 1D [qlen, ...] and pad to [qlen_max, ...]
-        #     #    CRITICAL: hidden_states must be flattened BEFORE padding so that
-        #     #    token positions align with topk_ids/topk_weights (also flat).
-        #     def _pad_flat(t, target_len, cur_len):
-        #         """Pad a [cur_len, ...] tensor to [target_len, ...]."""
-        #         if cur_len == target_len:
-        #             return t.contiguous()
-        #         pad_shape = list(t.shape)
-        #         pad_shape[0] = target_len - cur_len
-        #         return torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0).contiguous()
-
-        #     hs_flat = hidden_states.view(qlen, hidden_size)           # [qlen, H]
-        #     hs_padded = _pad_flat(hs_flat, qlen_max, qlen)            # [qlen_max, H]
-        #     ids_padded = _pad_flat(topk_ids, qlen_max, qlen)          # [qlen_max, K]
-        #     wts_padded = _pad_flat(topk_weights, qlen_max, qlen)      # [qlen_max, K]
-
-        #     # 3. Gather on rank 0
-        #     if rank == 0:
-        #         gathered_hs = [torch.empty_like(hs_padded) for _ in range(world_size)]
-        #         gathered_ids = [torch.empty_like(ids_padded) for _ in range(world_size)]
-        #         gathered_wts = [torch.empty_like(wts_padded) for _ in range(world_size)]
-        #     else:
-        #         gathered_hs = gathered_ids = gathered_wts = None
-
-        #     dist.gather(hs_padded, gathered_hs, dst=0)
-        #     dist.gather(ids_padded, gathered_ids, dst=0)
-        #     dist.gather(wts_padded, gathered_wts, dst=0)
-
-        #     # 4. Rank 0: run KT kernel on full gathered batch
-        #     if rank == 0:
-        #         all_hs = torch.cat(gathered_hs, dim=0)   # [qlen_max*W, H]
-        #         all_ids = torch.cat(gathered_ids, dim=0)  # [qlen_max*W, K]
-        #         all_wts = torch.cat(gathered_wts, dim=0)  # [qlen_max*W, K]
-        #         total_qlen = qlen_max * world_size
-
-        #         all_output = wrapper.forward_sft(
-        #             hidden_states=all_hs,
-        #             expert_ids=all_ids,
-        #             weights=all_wts,
-        #             save_for_backward=training,
-        #             output_device=original_device,
-        #         )
-        #         # all_output: [total_qlen, H] → split into per-rank chunks of qlen_max
-        #         all_output = all_output.to(dtype=original_dtype)
-        #         scatter_list = list(all_output.view(world_size, qlen_max, hidden_size).unbind(0))
-        #         scatter_list = [c.contiguous() for c in scatter_list]
-        #     else:
-        #         scatter_list = None
-
-        #     # 5. Scatter back and trim to local qlen
-        #     output_padded = torch.empty(qlen_max, hidden_size, device=original_device, dtype=original_dtype)
-        #     dist.scatter(output_padded, scatter_list, src=0)
-        #     output = output_padded[:qlen].view(batch_size, seq_len, hidden_size)
-        # elif wrapper is not None:
-        #     # ---- Single-GPU path ----
-        #     input_flat = hidden_states.view(qlen, hidden_size)
-        #     expert_ids = topk_ids.view(qlen, num_experts_per_tok)
-        #     weights = topk_weights.view(qlen, num_experts_per_tok)
-
-        #     output = wrapper.forward_sft(
-        #         hidden_states=input_flat,
-        #         expert_ids=expert_ids,
-        #         weights=weights,
-        #         save_for_backward=training,
-        #         output_device=original_device,
-        #     )
-        #     output = output.view(batch_size, seq_len, hidden_size).to(dtype=original_dtype)
-        # else:
-        #     output = torch.empty(
-        #         batch_size, seq_len, hidden_size, device=original_device, dtype=original_dtype
-        #     )
+            output_padded = torch.empty(qlen_max, hidden_size, device=original_device, dtype=original_dtype)
+            _track_lifecycle_tensor(
+                rank,
+                layer_idx,
+                "autograd.output_padded",
+                output_padded,
+            )
+            dist.scatter(output_padded, scatter_list, src=0)
+            # clone() breaks the view alias so the padded base tensor can be freed.
+            output = output_padded[:qlen].clone().view(batch_size, seq_len, hidden_size)
+            _track_lifecycle_tensor(
+                rank,
+                layer_idx,
+                "autograd.output",
+                output,
+            )
+            del output_padded
+        elif wrapper is not None:
+            # Single-GPU: sync directly
+            if KT_MEM_LOG:
+                _kt_mem_log_wrapper(
+                    rank,
+                    "autograd_single_before_sync",
+                    wrapper,
+                    device=original_device if original_device.type == "cuda" else None,
+                    layer=layer_idx,
+                )
+            cpu_output = wrapper.sync_forward_sft(output_device=original_device)
+            _track_lifecycle_tensor(
+                rank,
+                layer_idx,
+                "autograd.single.cpu_output",
+                cpu_output,
+            )
+            output = cpu_output.view(batch_size, seq_len, hidden_size).to(dtype=original_dtype)
+            _track_lifecycle_tensor(
+                rank,
+                layer_idx,
+                "autograd.output",
+                output,
+            )
+            if KT_MEM_LOG:
+                _kt_mem_log_wrapper(
+                    rank,
+                    "autograd_single_after_sync",
+                    wrapper,
+                    device=original_device if original_device.type == "cuda" else None,
+                    layer=layer_idx,
+                    cpu_output_bytes=_tensor_nbytes(cpu_output),
+                )
+        else:
+            # Broadcast-only rank (no wrapper)
+            output = torch.empty(
+                batch_size, seq_len, hidden_size, device=original_device, dtype=original_dtype
+            )
 
         ctx.wrapper = wrapper
-        ctx.peft_lora_modules = peft_lora_modules
         ctx.hidden_size = hidden_size
         ctx.qlen = qlen
         ctx.batch_size = batch_size
         ctx.seq_len = seq_len
         ctx.original_device = original_device
         ctx.original_dtype = original_dtype
-        ctx.layer_idx = layer_idx
-        ctx.train_lora = train_lora
         ctx.weights_shape = topk_weights.shape
         ctx.weights_dtype = topk_weights.dtype
         ctx.weights_device = topk_weights.device
         ctx.dist_on = dist_on
         ctx.world_size = world_size
         ctx.num_experts_per_tok = num_experts_per_tok
-        ctx.weight_names = weight_names
+        ctx.layer_idx = layer_idx
 
         return output
 
@@ -1040,6 +1560,23 @@ class KTMoEFunction(torch.autograd.Function):
 
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
+        ctx_uid = int(getattr(ctx, "_kt_ctx_uid", -1))
+        if KT_MEM_LOG:
+            _kt_mem_log(
+                rank,
+                "autograd_backward_entry",
+                layer=getattr(ctx, "layer_idx", -1),
+                ctx_uid=ctx_uid,
+                dist_on=bool(dist_on),
+                use_broadcast=bool(getattr(ctx, "use_broadcast", False)),
+                qlen=qlen,
+                hidden_size=hidden_size,
+                grad_output_shape=str(tuple(grad_output.shape)),
+                grad_output_dtype=str(grad_output.dtype),
+                grad_output_requires_grad=bool(getattr(grad_output, "requires_grad", False)),
+            )
+        if KT_LIFECYCLE_LOG and rank == 0 and ctx_uid >= 0:
+            _ctx_backward_enter(rank, layer=getattr(ctx, "layer_idx", -1), ctx_uid=ctx_uid)
 
         if dist_on:
             # ---- Data-parallel gather/scatter backward ----
@@ -1060,11 +1597,29 @@ class KTMoEFunction(torch.autograd.Function):
                 return torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0).contiguous()
 
             grad_out_flat = grad_output.view(qlen, hidden_size)
+            _track_lifecycle_tensor(
+                rank,
+                getattr(ctx, "layer_idx", -1),
+                "autograd.backward.grad_out_flat",
+                grad_out_flat,
+            )
             grad_out_padded = _pad_flat(grad_out_flat, qlen_max, qlen)  # [qlen_max, H]
+            _track_lifecycle_tensor(
+                rank,
+                getattr(ctx, "layer_idx", -1),
+                "autograd.backward.grad_out_padded",
+                grad_out_padded,
+            )
 
             # 3. Gather on rank 0
             if rank == 0:
                 gathered_go = [torch.empty_like(grad_out_padded) for _ in range(world_size)]
+                _track_lifecycle_collection(
+                    rank,
+                    getattr(ctx, "layer_idx", -1),
+                    "autograd.backward.gathered_go",
+                    gathered_go,
+                )
             else:
                 gathered_go = None
             dist.gather(grad_out_padded, gathered_go, dst=0)
@@ -1072,8 +1627,24 @@ class KTMoEFunction(torch.autograd.Function):
             # 4. Rank 0: run backward on full gathered batch
             if rank == 0:
                 all_go = torch.cat(gathered_go, dim=0)  # [qlen_max*W, H]
+                _track_lifecycle_tensor(
+                    rank,
+                    getattr(ctx, "layer_idx", -1),
+                    "autograd.backward.rank0.all_go",
+                    all_go,
+                )
                 total_qlen = qlen_max * world_size
 
+                if KT_MEM_LOG:
+                    _kt_mem_log_wrapper(
+                        rank,
+                        "backward_rank0_before_wrapper",
+                        ctx.wrapper,
+                        device=ctx.original_device if ctx.original_device.type == "cuda" else None,
+                        layer=getattr(ctx, "layer_idx", -1),
+                        qlen=total_qlen,
+                        grad_output_bytes=_tensor_nbytes(all_go),
+                    )
                 backward_out = ctx.wrapper.backward(
                     all_go,
                     output_device=ctx.original_device,
@@ -1084,15 +1655,43 @@ class KTMoEFunction(torch.autograd.Function):
                     all_grad_input, _, all_grad_weights = backward_out
                 else:
                     raise ValueError("KTMoEWrapper.backward returned unexpected format.")
+                if KT_MEM_LOG:
+                    _kt_mem_log_wrapper(
+                        rank,
+                        "backward_rank0_after_wrapper",
+                        ctx.wrapper,
+                        device=ctx.original_device if ctx.original_device.type == "cuda" else None,
+                        layer=getattr(ctx, "layer_idx", -1),
+                        grad_input_bytes=_tensor_nbytes(all_grad_input),
+                        grad_weights_bytes=_tensor_nbytes(all_grad_weights),
+                    )
 
                 # all_grad_input: [total_qlen, H], all_grad_weights: [total_qlen, K]
                 all_grad_input = all_grad_input.to(dtype=ctx.original_dtype)
                 all_grad_weights = all_grad_weights.to(dtype=torch.bfloat16)
+                _track_lifecycle_tensor(
+                    rank,
+                    getattr(ctx, "layer_idx", -1),
+                    "autograd.backward.rank0.all_grad_input",
+                    all_grad_input,
+                )
 
                 scatter_gi = list(all_grad_input.view(world_size, qlen_max, -1).unbind(0))
                 scatter_gi = [c.contiguous() for c in scatter_gi]
                 scatter_gw = list(all_grad_weights.view(world_size, qlen_max, -1).unbind(0))
                 scatter_gw = [c.contiguous() for c in scatter_gw]
+                _track_lifecycle_collection(
+                    rank,
+                    getattr(ctx, "layer_idx", -1),
+                    "autograd.backward.rank0.scatter_gi",
+                    scatter_gi,
+                )
+                _track_lifecycle_collection(
+                    rank,
+                    getattr(ctx, "layer_idx", -1),
+                    "autograd.backward.rank0.scatter_gw",
+                    scatter_gw,
+                )
             else:
                 scatter_gi = None
                 scatter_gw = None
@@ -1100,32 +1699,116 @@ class KTMoEFunction(torch.autograd.Function):
             # 5. Scatter back and trim to local qlen
             gi_padded = torch.empty(qlen_max, hidden_size, device=ctx.original_device, dtype=ctx.original_dtype)
             gw_padded = torch.empty(qlen_max, num_experts_per_tok, device=ctx.weights_device, dtype=torch.bfloat16)
+            _track_lifecycle_tensor(
+                rank,
+                getattr(ctx, "layer_idx", -1),
+                "autograd.backward.gi_padded",
+                gi_padded,
+            )
+            _track_lifecycle_tensor(
+                rank,
+                getattr(ctx, "layer_idx", -1),
+                "autograd.backward.gw_padded",
+                gw_padded,
+            )
             dist.scatter(gi_padded, scatter_gi, src=0)
             dist.scatter(gw_padded, scatter_gw, src=0)
             grad_input = gi_padded[:qlen].view(batch_size, seq_len, hidden_size)
             grad_weights = gw_padded[:qlen].view(ctx.weights_shape).to(dtype=ctx.weights_dtype)
+            _track_lifecycle_tensor(
+                rank,
+                getattr(ctx, "layer_idx", -1),
+                "autograd.backward.grad_input",
+                grad_input,
+            )
+            _track_lifecycle_tensor(
+                rank,
+                getattr(ctx, "layer_idx", -1),
+                "autograd.backward.grad_weights",
+                grad_weights,
+            )
 
         elif not ctx.use_broadcast:
             # ---- Single-GPU path ----
             grad_output_flat = grad_output.view(qlen, hidden_size)
+            _track_lifecycle_tensor(
+                rank,
+                getattr(ctx, "layer_idx", -1),
+                "autograd.backward.grad_output_flat",
+                grad_output_flat,
+            )
+            if KT_MEM_LOG:
+                _kt_mem_log_wrapper(
+                    rank,
+                    "backward_single_before_wrapper",
+                    ctx.wrapper,
+                    device=ctx.original_device if ctx.original_device.type == "cuda" else None,
+                    layer=getattr(ctx, "layer_idx", -1),
+                    qlen=qlen,
+                    grad_output_bytes=_tensor_nbytes(grad_output_flat),
+                )
             backward_out = ctx.wrapper.backward(
                 grad_output_flat,
                 output_device=ctx.original_device,
             )
+            ctx.wrapper._kt_has_cached_forward = False
             if isinstance(backward_out, tuple) and len(backward_out) == 2:
                 grad_input, grad_weights = backward_out
             elif isinstance(backward_out, tuple) and len(backward_out) == 3:
                 grad_input, _, grad_weights = backward_out
             else:
                 raise ValueError("KTMoEWrapper.backward returned unexpected format.")
+            if KT_MEM_LOG:
+                _kt_mem_log_wrapper(
+                    rank,
+                    "backward_single_after_wrapper",
+                    ctx.wrapper,
+                    device=ctx.original_device if ctx.original_device.type == "cuda" else None,
+                    layer=getattr(ctx, "layer_idx", -1),
+                    grad_input_bytes=_tensor_nbytes(grad_input),
+                    grad_weights_bytes=_tensor_nbytes(grad_weights),
+                )
             grad_input = grad_input.view(batch_size, seq_len, hidden_size).to(dtype=ctx.original_dtype)
             grad_weights = grad_weights.to(dtype=torch.bfloat16)
+            _track_lifecycle_tensor(
+                rank,
+                getattr(ctx, "layer_idx", -1),
+                "autograd.backward.grad_input",
+                grad_input,
+            )
+            _track_lifecycle_tensor(
+                rank,
+                getattr(ctx, "layer_idx", -1),
+                "autograd.backward.grad_weights",
+                grad_weights,
+            )
         else:
             # No wrapper, no dist — shouldn't happen in normal flow
             grad_input = torch.zeros(batch_size, seq_len, hidden_size, device=ctx.original_device, dtype=ctx.original_dtype)
             grad_weights = torch.zeros(ctx.weights_shape, device=ctx.weights_device, dtype=ctx.weights_dtype)
 
-        return grad_input, None, grad_weights, None, None, None, None, None, None, None, None, None, None
+        if KT_LIFECYCLE_LOG and rank == 0:
+            with _LIFECYCLE_LOCK:
+                global _LIFECYCLE_BACKWARD_COUNT
+                _LIFECYCLE_BACKWARD_COUNT += 1
+                backward_count = _LIFECYCLE_BACKWARD_COUNT
+            if ctx_uid >= 0:
+                _ctx_backward_exit(rank, layer=getattr(ctx, "layer_idx", -1), ctx_uid=ctx_uid)
+            if backward_count % 16 == 0:
+                _log_lifecycle_snapshot(
+                    rank,
+                    layer=getattr(ctx, "layer_idx", -1),
+                    tag=f"after_backward_{backward_count}",
+                    topk=12,
+                )
+                _ctx_snapshot(
+                    rank,
+                    layer=getattr(ctx, "layer_idx", -1),
+                    tag=f"after_backward_{backward_count}",
+                    topk=12,
+                )
+
+        return grad_input, None, grad_weights, None, None, None, None, None, None, None, None
 
 
 # =============================================================================
@@ -1262,21 +1945,81 @@ class KTMoELayerWrapper(nn.Module):
             )
 
         train_lora = self._peft_lora_modules is not None and len(self._peft_lora_modules) > 0
-        has_gpu_components = self.shared_experts is not None or self.lora_experts is not None
-        # Only ask KT kernel to save forward caches if a backward pass will actually run.
+        _track_lifecycle_tensor(
+            rank,
+            self.layer_idx,
+            "forward.hidden_states",
+            hidden_states,
+        )
+        _track_lifecycle_tensor(
+            rank,
+            self.layer_idx,
+            "forward.topk_ids",
+            topk_ids,
+        )
+        _track_lifecycle_tensor(
+            rank,
+            self.layer_idx,
+            "forward.topk_weights",
+            topk_weights,
+        )
         save_for_backward = (
             self.training
             and torch.is_grad_enabled()
             and (hidden_states.requires_grad or topk_weights.requires_grad or train_lora)
         )
+        ckpt_hook_mode = _checkpoint_hook_mode()
+        in_ckpt_recompute = ckpt_hook_mode == "recompute"
+        in_ckpt_first_forward = ckpt_hook_mode == "first_forward"
+        if ckpt_hook_mode in ("none", "other", "error"):
+            # Fallback for environments where hook-top probing is unavailable.
+            in_ckpt_first_forward = _is_in_checkpoint_first_forward()
+        if in_ckpt_recompute:
+            # Recompute must be treated as non-first-forward in diagnostics.
+            in_ckpt_first_forward = False
+        # Keep KT autograd path whenever backward is needed. Disabling it in
+        # checkpoint first-forward prevents KTMoEFunction.backward from running.
+        use_autograd_path = save_for_backward
+        save_for_backward_submit = use_autograd_path
+        if KT_MEM_LOG:
+            graph_task_id = -1
+            try:
+                graph_task_id = int(torch._C._current_graph_task_id())
+            except Exception:
+                graph_task_id = -1
+            _kt_mem_log(
+                rank,
+                "forward_state",
+                layer=self.layer_idx,
+                training=self.training,
+                grad_enabled=torch.is_grad_enabled(),
+                hidden_states_requires_grad=hidden_states.requires_grad,
+                topk_weights_requires_grad=topk_weights.requires_grad,
+                train_lora=train_lora,
+                save_for_backward=save_for_backward,
+                save_for_backward_submit=save_for_backward_submit,
+                use_autograd_path=use_autograd_path,
+                in_ckpt_first_forward=in_ckpt_first_forward,
+                in_ckpt_recompute=in_ckpt_recompute,
+                ckpt_hook_mode=ckpt_hook_mode,
+                graph_task_id=graph_task_id,
+            )
+            _kt_mem_log_wrapper(
+                rank,
+                "forward_wrapper_state",
+                self.wrapper,
+                device=hidden_states.device if hidden_states.device.type == "cuda" else None,
+                layer=self.layer_idx,
+                save_for_backward=save_for_backward_submit,
+                qlen=hidden_states.shape[0] * hidden_states.shape[1],
+            )
         if KT_DEBUG:
             logger.warning(
-                "[KT DEBUG] rank %s KTMoELayerWrapper.forward layer=%s train_lora=%s has_gpu_components=%s "
+                "[KT DEBUG] rank %s KTMoELayerWrapper.forward layer=%s train_lora=%s "
                 "save_for_backward=%s",
                 rank,
                 self.layer_idx,
                 train_lora,
-                has_gpu_components,
                 save_for_backward,
             )
 
@@ -1293,106 +2036,69 @@ class KTMoELayerWrapper(nn.Module):
             
 
 
-        # Overlap: rank 0 submits CPU expert work, all ranks compute GPU shared_experts concurrently.
-        # In dist mode, all ranks MUST enter _forward_with_overlap together because it uses
-        # collectives (all_gather, gather, scatter) that require all-rank participation.
-        use_overlap = has_gpu_components and save_for_backward and (dist_on or self.wrapper is not None)
         if KT_DEBUG:
             logger.warning(
-                "[KT DEBUG] rank %s KTMoELayerWrapper.forward layer=%s use_overlap=%s",
-                rank,
-                self.layer_idx,
-                use_overlap,
-            )
-
-        def compute_gpu_output() -> torch.Tensor | None:
-            gpu_output = None
-            if self.shared_experts is not None:
-                if KT_DEBUG:
-                    logger.warning(
-                        "[KT DEBUG] rank %s KTMoELayerWrapper.forward shared_experts start layer=%s",
-                        rank,
-                        self.layer_idx,
-                    )
-                gpu_output = self.shared_experts(hidden_states)
-                if KT_DEBUG:
-                    logger.warning(
-                        "[KT DEBUG] rank %s KTMoELayerWrapper.forward shared_experts done layer=%s",
-                        rank,
-                        self.layer_idx,
-                    )
-            if self.lora_experts is not None:
-                if KT_DEBUG:
-                    logger.warning(
-                        "[KT DEBUG] rank %s KTMoELayerWrapper.forward lora_experts start layer=%s",
-                        rank,
-                        self.layer_idx,
-                    )
-                lora_out = self.lora_experts(hidden_states)
-                if KT_DEBUG:
-                    logger.warning(
-                        "[KT DEBUG] rank %s KTMoELayerWrapper.forward lora_experts done layer=%s",
-                        rank,
-                        self.layer_idx,
-                    )
-                gpu_output = lora_out if gpu_output is None else gpu_output + lora_out
-            return gpu_output
-
-        precomputed_output = None
-        gpu_output = None
-        # In dist mode, all ranks must participate in overlap (gather/scatter collectives).
-        # In single-GPU mode, only rank 0 (which has wrapper) uses overlap.
-  
-        if KT_DEBUG:
-            logger.warning(
-                "[KT DEBUG] rank %s KTMoELayerWrapper.forward overlap path start layer=%s",
+                "[KT DEBUG] rank %s KTMoELayerWrapper.forward submit+gpu start layer=%s",
                 rank,
                 self.layer_idx,
             )
-            
-        precomputed_output, gpu_output = self._forward_with_overlap(
+
+        gpu_output, qlen_max = self._submit_and_compute_gpu(
             hidden_states,
             topk_ids,
             topk_weights,
-            compute_gpu_output,
-            save_for_backward,
+            save_for_backward_submit,
+        )
+        _track_lifecycle_tensor(
+            rank,
+            self.layer_idx,
+            "forward.gpu_output",
+            gpu_output,
         )
         if KT_DEBUG:
             logger.warning(
-                "[KT DEBUG] rank %s KTMoELayerWrapper.forward overlap path done layer=%s precomputed=%s %s",
+                "[KT DEBUG] rank %s KTMoELayerWrapper.forward submit+gpu done layer=%s qlen_max=%s",
                 rank,
                 self.layer_idx,
-                tuple(precomputed_output.shape),
-                precomputed_output.dtype,
+                qlen_max,
             )
 
-            
-
-        lora_ref = hidden_states.new_empty(())
-        if train_lora and self._peft_lora_modules:
-            # Get a PEFT LoRA parameter for autograd tracking
-            for expert_loras in self._peft_lora_modules.values():
-                for lora_A, lora_B in expert_loras.values():
-                    if hasattr(lora_A, 'weight') and lora_A.weight.requires_grad:
-                        lora_ref = lora_A.weight
+        # Use KTMoEFunction whenever backward is needed so KT backward and LoRA
+        # gradient paths remain connected.
+        if use_autograd_path:
+            lora_ref = hidden_states.new_empty(())
+            if train_lora and self._peft_lora_modules:
+                for expert_loras in self._peft_lora_modules.values():
+                    for lora_A, lora_B in expert_loras.values():
+                        if hasattr(lora_A, 'weight') and lora_A.weight.requires_grad:
+                            lora_ref = lora_A.weight
+                            break
+                    if lora_ref.numel() > 0:
                         break
-                if lora_ref.numel() > 0:
-                    break
 
-        moe_output = KTMoEFunction.apply(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            self.wrapper,
-            self._peft_lora_modules,  # Pass PEFT LoRA modules instead of lora_params
-            lora_ref,
-            self.hidden_size,
-            self.moe_config.num_experts_per_tok,
+            moe_output = KTMoEFunction.apply(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                self.wrapper,
+                lora_ref,
+                self.hidden_size,
+                self.moe_config.num_experts_per_tok,
+                self.layer_idx,
+                save_for_backward,
+                train_lora,
+                qlen_max,
+            )
+        else:
+            moe_output = self._sync_forward_output_no_autograd(
+                hidden_states=hidden_states,
+                qlen_max=qlen_max,
+            )
+        _track_lifecycle_tensor(
+            rank,
             self.layer_idx,
-            save_for_backward,
-            train_lora,
-            precomputed_output,
-            self.moe_config.weight_names,  # (gate_name, up_name, down_name) for grad mapping
+            "forward.moe_output",
+            moe_output,
         )
         
 
@@ -1404,6 +2110,28 @@ class KTMoELayerWrapper(nn.Module):
                     self.layer_idx,
                 )
             moe_output = moe_output + gpu_output
+        if KT_MEM_LOG:
+            grad_fn_name = "None"
+            try:
+                gf = getattr(moe_output, "grad_fn", None)
+                if gf is not None:
+                    grad_fn_name = type(gf).__name__
+            except Exception:
+                grad_fn_name = "error"
+            _kt_mem_log(
+                rank,
+                "forward_output_grad_state",
+                layer=self.layer_idx,
+                use_autograd_path=use_autograd_path,
+                in_ckpt_first_forward=in_ckpt_first_forward,
+                in_ckpt_recompute=in_ckpt_recompute,
+                ckpt_hook_mode=ckpt_hook_mode,
+                moe_output_requires_grad=bool(getattr(moe_output, "requires_grad", False)),
+                moe_output_grad_fn=grad_fn_name,
+                hidden_states_requires_grad=bool(getattr(hidden_states, "requires_grad", False)),
+                topk_weights_requires_grad=bool(getattr(topk_weights, "requires_grad", False)),
+                train_lora=bool(train_lora),
+            )
 
         if KT_DEBUG:
             logger.warning(
@@ -1416,33 +2144,123 @@ class KTMoELayerWrapper(nn.Module):
             
         return moe_output
 
-    def _compute_routing(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        router = getattr(self, self._router_attr)
-        if self.router_type == "deepseek_gate":
-            router_output = router(hidden_states)
-            if len(router_output) == 2:
-                topk_ids, topk_weights = router_output
+    def _sync_forward_output_no_autograd(
+        self,
+        hidden_states: torch.Tensor,
+        qlen_max: int,
+    ) -> torch.Tensor:
+        """Sync CPU expert output without creating KTMoEFunction autograd nodes."""
+        import torch.distributed as dist
+
+        original_device = hidden_states.device
+        original_dtype = hidden_states.dtype
+        batch_size, seq_len, _ = hidden_states.shape
+        qlen = batch_size * seq_len
+
+        dist_on = dist.is_initialized() and dist.get_world_size() > 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist_on else 1
+
+        if dist_on:
+            if rank == 0:
+                if self.wrapper is None:
+                    raise RuntimeError("Rank0 wrapper is required in distributed KT overlap path.")
+                cpu_output = self.wrapper.sync_forward_sft(output_device=original_device)
+                cpu_output = cpu_output.to(dtype=original_dtype)
+                _track_lifecycle_tensor(
+                    rank,
+                    self.layer_idx,
+                    "no_autograd.rank0.cpu_output",
+                    cpu_output,
+                )
+                scatter_list = list(cpu_output.view(world_size, qlen_max, self.hidden_size).unbind(0))
+                scatter_list = [c.contiguous() for c in scatter_list]
+                _track_lifecycle_collection(
+                    rank,
+                    self.layer_idx,
+                    "no_autograd.rank0.scatter_list",
+                    scatter_list,
+                )
             else:
-                topk_ids, topk_weights = router_output[0], router_output[1]
-            if topk_weights.is_floating_point():
-                topk_weights = topk_weights.to(torch.bfloat16)
+                scatter_list = None
+
+            output_padded = torch.empty(qlen_max, self.hidden_size, device=original_device, dtype=original_dtype)
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "no_autograd.output_padded",
+                output_padded,
+            )
+            dist.scatter(output_padded, scatter_list, src=0)
+            output = output_padded[:qlen].clone().view(batch_size, seq_len, self.hidden_size)
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "no_autograd.output",
+                output,
+            )
+            del output_padded
+            return output
+
+        if self.wrapper is not None:
+            cpu_output = self.wrapper.sync_forward_sft(output_device=original_device)
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "no_autograd.single.cpu_output",
+                cpu_output,
+            )
+            output = cpu_output.view(batch_size, seq_len, self.hidden_size).to(dtype=original_dtype)
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "no_autograd.output",
+                output,
+            )
+            return output
+
+        return torch.empty(batch_size, seq_len, self.hidden_size, device=original_device, dtype=original_dtype)
+
+    def _compute_routing(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Run routing under no_grad to avoid creating autograd nodes whose
+        # SavedVariables become orphan holders inside gradient checkpoint.
+        # The gate is frozen during LoRA fine-tuning and the main gradient
+        # flows through KTMoEFunction.backward()'s grad_input, so the
+        # routing gradient contribution to hidden_states can be safely dropped.
+        with torch.no_grad():
+            router = getattr(self, self._router_attr)
+            if self.router_type == "deepseek_gate":
+                # DeepSeek V3's MoEGate has `assert not self.training` in its noaux_tc
+                # routing path because the HF model is an inference-only port.
+                # For LoRA fine-tuning the router is frozen, so eval() is safe.
+                was_training = router.training
+                if was_training:
+                    router.eval()
+                router_output = router(hidden_states)
+                if was_training:
+                    router.train()
+                if len(router_output) == 2:
+                    topk_ids, topk_weights = router_output
+                else:
+                    topk_ids, topk_weights = router_output[0], router_output[1]
+                if topk_weights.is_floating_point():
+                    topk_weights = topk_weights.to(torch.bfloat16)
+                return topk_ids, topk_weights
+
+            router_logits = router(hidden_states.view(-1, self.hidden_size))
+            routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+            topk_weights, topk_ids = torch.topk(routing_weights, self.moe_config.num_experts_per_tok, dim=-1)
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights.to(torch.bfloat16)
             return topk_ids, topk_weights
 
-        router_logits = router(hidden_states.view(-1, self.hidden_size))
-        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        topk_weights, topk_ids = torch.topk(routing_weights, self.moe_config.num_experts_per_tok, dim=-1)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights.to(torch.bfloat16)
-        return topk_ids, topk_weights
-
-    def _forward_with_overlap(
+    def _submit_and_compute_gpu(
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        compute_gpu_output: Any,
         save_for_backward: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, int]:
         import torch.distributed as dist
         
 
@@ -1455,7 +2273,18 @@ class KTMoELayerWrapper(nn.Module):
         world_size = dist.get_world_size() if dist_on else 1
 
         qlen = batch_size * seq_len
-        
+        if KT_MEM_LOG and hidden_states.is_cuda:
+            dev = hidden_states.device
+            _kt_mem_log(
+                rank,
+                "overlap_enter",
+                layer=self.layer_idx,
+                qlen=qlen,
+                hidden_size=self.hidden_size,
+                mem_allocated_bytes=torch.cuda.memory_allocated(dev),
+                mem_reserved_bytes=torch.cuda.memory_reserved(dev),
+                mem_max_allocated_bytes=torch.cuda.max_memory_allocated(dev),
+            )
 
         if dist_on:
             # ---- Gather inputs from all ranks before submitting CPU work ----
@@ -1472,20 +2301,92 @@ class KTMoELayerWrapper(nn.Module):
                 return torch.cat([t, torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=0).contiguous()
 
             hs_flat = hidden_states.view(qlen, self.hidden_size)      # [qlen, H]
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "overlap.hs_flat",
+                hs_flat,
+            )
             hs_padded = _pad_flat(hs_flat, qlen_max, qlen)            # [qlen_max, H]
             ids_padded = _pad_flat(topk_ids, qlen_max, qlen)
             wts_padded = _pad_flat(topk_weights, qlen_max, qlen)
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "overlap.hs_padded",
+                hs_padded,
+            )
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "overlap.ids_padded",
+                ids_padded,
+            )
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "overlap.wts_padded",
+                wts_padded,
+            )
+            if KT_MEM_LOG:
+                _kt_mem_log(
+                    rank,
+                    "overlap_padded",
+                    layer=self.layer_idx,
+                    qlen_max=qlen_max,
+                    hs_padded_bytes=_tensor_nbytes(hs_padded),
+                    ids_padded_bytes=_tensor_nbytes(ids_padded),
+                    wts_padded_bytes=_tensor_nbytes(wts_padded),
+                )
 
-            # Differentiable all_gather for hidden_states (needed by both CPU experts and shared_experts)
+            # All_gather for hidden_states (needed by both CPU experts and shared_experts).
             from torch.distributed.nn.functional import all_gather as diff_all_gather
             all_hs_list = diff_all_gather(hs_padded)  # list of [qlen_max, H] with autograd
+            _track_lifecycle_collection(
+                rank,
+                self.layer_idx,
+                "overlap.all_hs_list",
+                all_hs_list,
+            )
+            all_hs_list_bytes = _tensor_nbytes(all_hs_list)
             all_hs = torch.cat(all_hs_list, dim=0)    # [qlen_max*W, H]
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "overlap.all_hs",
+                all_hs,
+            )
             total_qlen = qlen_max * world_size
+
+            if KT_MEM_LOG and hidden_states.is_cuda:
+                _kt_mem_log(
+                    rank,
+                    "overlap_all_hs",
+                    layer=self.layer_idx,
+                    total_qlen=total_qlen,
+                    all_hs_list_bytes=all_hs_list_bytes,
+                    all_hs_bytes=_tensor_nbytes(all_hs),
+                    mem_allocated_bytes=torch.cuda.memory_allocated(hidden_states.device),
+                    mem_reserved_bytes=torch.cuda.memory_reserved(hidden_states.device),
+                    mem_max_allocated_bytes=torch.cuda.max_memory_allocated(hidden_states.device),
+                )
 
             # Gather ids/wts to rank 0 only (no grad needed, only rank 0 uses them for CPU experts)
             if rank == 0:
                 gathered_ids = [torch.empty_like(ids_padded) for _ in range(world_size)]
                 gathered_wts = [torch.empty_like(wts_padded) for _ in range(world_size)]
+                _track_lifecycle_collection(
+                    rank,
+                    self.layer_idx,
+                    "overlap.rank0.gathered_ids",
+                    gathered_ids,
+                )
+                _track_lifecycle_collection(
+                    rank,
+                    self.layer_idx,
+                    "overlap.rank0.gathered_wts",
+                    gathered_wts,
+                )
             else:
                 gathered_ids = gathered_wts = None
 
@@ -1496,9 +2397,52 @@ class KTMoELayerWrapper(nn.Module):
             if rank == 0:
                 all_ids = torch.cat(gathered_ids, dim=0)  # [qlen_max*W, K]
                 all_wts = torch.cat(gathered_wts, dim=0)  # [qlen_max*W, K]
-                self.wrapper.submit_forward_sft(
-                    all_hs.detach(), all_ids, all_wts, save_for_backward=save_for_backward
+                _track_lifecycle_tensor(
+                    rank,
+                    self.layer_idx,
+                    "overlap.rank0.all_ids",
+                    all_ids,
                 )
+                _track_lifecycle_tensor(
+                    rank,
+                    self.layer_idx,
+                    "overlap.rank0.all_wts",
+                    all_wts,
+                )
+                if KT_MEM_LOG:
+                    _kt_mem_log(
+                        rank,
+                        "overlap_rank0_gathered",
+                        layer=self.layer_idx,
+                        gathered_ids_bytes=_tensor_nbytes(gathered_ids),
+                        gathered_wts_bytes=_tensor_nbytes(gathered_wts),
+                        all_ids_bytes=_tensor_nbytes(all_ids),
+                        all_wts_bytes=_tensor_nbytes(all_wts),
+                    )
+                    _kt_mem_log_wrapper(
+                        rank,
+                        "overlap_rank0_before_submit",
+                        self.wrapper,
+                        device=original_device if original_device.type == "cuda" else None,
+                        layer=self.layer_idx,
+                        qlen=total_qlen,
+                        save_for_backward=save_for_backward,
+                        all_hs_bytes=_tensor_nbytes(all_hs),
+                        all_ids_bytes=_tensor_nbytes(all_ids),
+                        all_wts_bytes=_tensor_nbytes(all_wts),
+                    )
+                self.wrapper.submit_forward_sft(
+                    all_hs.detach(), all_ids.detach(), all_wts.detach(), save_for_backward=save_for_backward
+                )
+                if KT_MEM_LOG:
+                    _kt_mem_log_wrapper(
+                        rank,
+                        "overlap_rank0_after_submit",
+                        self.wrapper,
+                        device=original_device if original_device.type == "cuda" else None,
+                        layer=self.layer_idx,
+                        save_for_backward=save_for_backward,
+                    )
 
             # All ranks compute shared_experts on the SAME gathered input concurrently
             # with CPU expert work. FSDP2-wrapped shared_experts requires all ranks to
@@ -1509,40 +2453,112 @@ class KTMoELayerWrapper(nn.Module):
                 all_shared_out = self.shared_experts(
                     all_hs.view(1, total_qlen, self.hidden_size)
                 )
+                _track_lifecycle_tensor(
+                    rank,
+                    self.layer_idx,
+                    "overlap.all_shared_out",
+                    all_shared_out,
+                )
                 all_shared_out = all_shared_out.to(dtype=original_dtype)
-                # Each rank takes its own slice
+                # Each rank takes its own slice; clone() breaks the view alias so
+                # the large all_shared_out base tensor can be freed immediately.
                 all_shared_out = all_shared_out.view(world_size, qlen_max, self.hidden_size)
-                gpu_output = all_shared_out[rank, :qlen].view(batch_size, seq_len, self.hidden_size)
+                gpu_output = all_shared_out[rank, :qlen].clone().view(batch_size, seq_len, self.hidden_size)
+                _track_lifecycle_tensor(
+                    rank,
+                    self.layer_idx,
+                    "overlap.shared_slice_gpu_output",
+                    gpu_output,
+                )
+                del all_shared_out
 
             if self.lora_experts is not None:
                 lora_out = self.lora_experts(hidden_states)
+                _track_lifecycle_tensor(
+                    rank,
+                    self.layer_idx,
+                    "overlap.lora_out",
+                    lora_out,
+                )
                 gpu_output = lora_out if gpu_output is None else gpu_output + lora_out
 
-            # Rank 0: sync CPU result and scatter back
-            if rank == 0:
-                cpu_output_gpu = self.wrapper.sync_forward_sft(output_device=original_device)
-                # cpu_output_gpu: [total_qlen, H] → split per rank
-                cpu_output_gpu = cpu_output_gpu.to(dtype=original_dtype)
-                scatter_list = list(cpu_output_gpu.view(world_size, qlen_max, self.hidden_size).unbind(0))
-                scatter_list = [c.contiguous() for c in scatter_list]
-            else:
-                scatter_list = None
+            return gpu_output, qlen_max
 
-            output_padded = torch.empty(qlen_max, self.hidden_size, device=original_device, dtype=original_dtype)
-            dist.scatter(output_padded, scatter_list, src=0)
-            precomputed_output = output_padded[:qlen].view(batch_size, seq_len, self.hidden_size)
         else:
-            # ---- Single-GPU overlap path ----
+            # ---- Single-GPU path: submit + GPU compute ----
             input_flat = hidden_states.view(qlen, self.hidden_size)
             expert_ids = topk_ids.view(qlen, self.moe_config.num_experts_per_tok)
             weights = topk_weights.view(qlen, self.moe_config.num_experts_per_tok)
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "single.input_flat",
+                input_flat,
+            )
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "single.expert_ids",
+                expert_ids,
+            )
+            _track_lifecycle_tensor(
+                rank,
+                self.layer_idx,
+                "single.weights",
+                weights,
+            )
 
-            self.wrapper.submit_forward_sft(input_flat, expert_ids, weights, save_for_backward=save_for_backward)
-            gpu_output = compute_gpu_output()
-            cpu_output_gpu = self.wrapper.sync_forward_sft(output_device=original_device)
-            precomputed_output = cpu_output_gpu.view(batch_size, seq_len, self.hidden_size).to(dtype=original_dtype)
-            
-        return precomputed_output, gpu_output
+            if KT_MEM_LOG:
+                _kt_mem_log_wrapper(
+                    rank,
+                    "submit_single_before",
+                    self.wrapper,
+                    device=original_device if original_device.type == "cuda" else None,
+                    layer=self.layer_idx,
+                    qlen=qlen,
+                    save_for_backward=save_for_backward,
+                )
+            # Avoid passing graph-attached tensors into C++ cache.
+            submit_hs = input_flat.detach()
+            submit_ids = expert_ids.detach()
+            submit_wts = weights.detach()
+            self.wrapper.submit_forward_sft(
+                submit_hs,
+                submit_ids,
+                submit_wts,
+                save_for_backward=save_for_backward,
+            )
+            if KT_MEM_LOG:
+                _kt_mem_log_wrapper(
+                    rank,
+                    "submit_single_after",
+                    self.wrapper,
+                    device=original_device if original_device.type == "cuda" else None,
+                    layer=self.layer_idx,
+                    save_for_backward=save_for_backward,
+                )
+
+            # GPU compute: shared_experts + lora_experts
+            gpu_output = None
+            if self.shared_experts is not None:
+                gpu_output = self.shared_experts(hidden_states)
+                _track_lifecycle_tensor(
+                    rank,
+                    self.layer_idx,
+                    "single.shared_gpu_output",
+                    gpu_output,
+                )
+            if self.lora_experts is not None:
+                lora_out = self.lora_experts(hidden_states)
+                _track_lifecycle_tensor(
+                    rank,
+                    self.layer_idx,
+                    "single.lora_out",
+                    lora_out,
+                )
+                gpu_output = lora_out if gpu_output is None else gpu_output + lora_out
+
+            return gpu_output, qlen
 
     def update_lora_pointers(self):
         """Sync PEFT LoRA weights to C++ kernel after optimizer update."""
@@ -1635,7 +2651,48 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
 
     checkpoint_files = getattr(kt_plugin, "kt_checkpoint_files", None)
     sharded_metadata = getattr(kt_plugin, "kt_sharded_metadata", None)
+
+    # When kt_expert_checkpoint_path is set, always resolve from it (overrides any existing
+    # checkpoint_files which may come from AttnOnlyBf16 and lack expert weights).
+    kt_expert_checkpoint_path = getattr(kt_plugin, "kt_expert_checkpoint_path", None)
+    if kt_expert_checkpoint_path:
+        print(
+            f"[kt_moe] Resolving expert checkpoint files from kt_expert_checkpoint_path={kt_expert_checkpoint_path!r}",
+            flush=True,
+        )
+        resolved_files, resolved_meta = _resolve_checkpoint_files(model_name_or_path=kt_expert_checkpoint_path)
+        if resolved_files and all(f.endswith(".safetensors") for f in resolved_files):
+            checkpoint_files = resolved_files
+            sharded_metadata = resolved_meta
+            kt_plugin.kt_checkpoint_files = checkpoint_files
+            kt_plugin.kt_sharded_metadata = sharded_metadata
+            print(
+                f"[kt_moe] Resolved {len(checkpoint_files)} checkpoint files from kt_expert_checkpoint_path",
+                flush=True,
+            )
+        else:
+            logger.warning(f"Failed to resolve checkpoint files from kt_expert_checkpoint_path={kt_expert_checkpoint_path!r}")
+
     use_checkpoint_files = bool(checkpoint_files) and not use_kt_weight_path
+
+    print(
+        f"[kt_moe] kt_weight_path={kt_weight_path!r} "
+        f"(is_dir={os.path.isdir(kt_weight_path) if kt_weight_path else 'N/A'})",
+        flush=True,
+    )
+    print(
+        f"[kt_moe] kt_expert_checkpoint_path={kt_expert_checkpoint_path!r}",
+        flush=True,
+    )
+    print(
+        f"[kt_moe] checkpoint_files count={len(checkpoint_files) if checkpoint_files else 0}",
+        flush=True,
+    )
+    print(
+        f"[kt_moe] use_kt_weight_path={use_kt_weight_path}, use_checkpoint_files={use_checkpoint_files}",
+        flush=True,
+    )
+
     if use_checkpoint_files:
         logger.info("Loading expert weights from checkpoint files (online conversion).")
     elif use_kt_weight_path and bool(checkpoint_files):
@@ -1659,46 +2716,45 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                 "files could be resolved for on-the-fly expert loading."
             )
 
+    import torch.distributed as _dist
+    _rank = _dist.get_rank() if _dist.is_initialized() else 0
+
     model_container, layers = _get_model_container_and_layers(model, purpose="wrapping")
+    print(f"[kt_moe rank={_rank}] Total layers={len(layers)}, is_rank_0={is_rank_0}", flush=True)
 
     for layer_idx, layer in enumerate(layers):
         moe_module = get_moe_module(layer, moe_config)
         if moe_module is None:
+            if layer_idx < 3 or layer_idx == len(layers) - 1:
+                print(f"[kt_moe rank={_rank}] Layer {layer_idx}: no MoE module, skipping", flush=True)
             continue
 
-        logger.info(
-            f"Wrapping MoE layer {layer_idx} with KTMoEWrapper "
-            f"(method={kt_method}, tp={threadpool_count})"
-        )
+        if is_rank_0:
+            print(
+                f"[kt_moe rank={_rank}] Wrapping MoE layer {layer_idx} "
+                f"(method={kt_method}, checkpoint_files={'yes' if checkpoint_files else 'no'})",
+                flush=True,
+            )
 
         # Only rank 0 loads weights and initializes KT kernel
         gate_proj, up_proj, down_proj = None, None, None
         wrapper = None
 
         if is_rank_0:
+            # Get block_size from quantization_config if available (for FP8 dequant)
+            _quant_cfg = getattr(model.config, "quantization_config", None)
+            _block_size = None
+            if _quant_cfg is not None:
+                _block_size = getattr(_quant_cfg, "weight_block_size", None)
+
             if use_kt_weight_path:
-                if checkpoint_files:
-                    layers_prefix = _get_layers_prefix(model.config)
-                    logger.info(
-                        f"  Layer {layer_idx}: loading BF16 from checkpoint files for backward, "
-                        f"INT8 forward from kt_weight_path={kt_weight_path!r}"
-                    )
-                    gate_proj, up_proj, down_proj = load_experts_from_checkpoint_files(
-                        checkpoint_files=checkpoint_files,
-                        sharded_metadata=sharded_metadata,
-                        layers_prefix=layers_prefix,
-                        moe_config=moe_config,
-                        layer_idx=layer_idx,
-                    )
-                else:
-                    logger.warning(
-                        f"  Layer {layer_idx}: no checkpoint files available for BF16 backward weights! "
-                        f"Falling back to extract_moe_weights (may be empty with cpu_ram_efficient_loading)"
-                    )
-                    gate_proj, up_proj, down_proj = extract_moe_weights(moe_module, moe_config)
-                    gate_proj = gate_proj.cpu().to(torch.bfloat16).contiguous()
-                    up_proj = up_proj.cpu().to(torch.bfloat16).contiguous()
-                    down_proj = down_proj.cpu().to(torch.bfloat16).contiguous()
+                # kt_weight_path has pre-quantized forward + backward .kt files.
+                # C++ loads them directly — no BF16 from checkpoint needed.
+                print(
+                    f"[kt_moe rank={_rank}] Layer {layer_idx}: "
+                    f"forward + backward from kt_weight_path (.kt files)",
+                    flush=True,
+                )
             elif use_checkpoint_files:
                 layers_prefix = _get_layers_prefix(model.config)
                 gate_proj, up_proj, down_proj = load_experts_from_checkpoint_files(
@@ -1707,6 +2763,7 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                     layers_prefix=layers_prefix,
                     moe_config=moe_config,
                     layer_idx=layer_idx,
+                    block_size=_block_size,
                 )
             else:
                 gate_proj, up_proj, down_proj = extract_moe_weights(moe_module, moe_config)
@@ -1741,18 +2798,12 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
             physical_to_logical_map = torch.arange(moe_config.expert_num, dtype=torch.int64, device="cpu")
 
             if use_kt_weight_path:
-                wrapper._bf16_gate_proj = gate_proj
-                wrapper._bf16_up_proj = up_proj
-                wrapper._bf16_down_proj = down_proj
                 print(
                     f"[kt_moe] Layer {layer_idx}: calling wrapper.load_weights() "
-                    f"(pre-quantized path, kt_weight_path={kt_weight_path!r})",
+                    f"(C++ direct .kt load, kt_weight_path={kt_weight_path!r})",
                     flush=True,
                 )
                 wrapper.load_weights(physical_to_logical_map)
-                wrapper._bf16_gate_proj = None
-                wrapper._bf16_up_proj = None
-                wrapper._bf16_down_proj = None
             else:
                 print(
                     f"[kt_moe] Layer {layer_idx}: calling wrapper.load_weights_from_tensors() "
@@ -1817,6 +2868,7 @@ def _build_kt_plugin_from_args(model_args: Any, finetuning_args: Any | None = No
         kt_max_cache_depth=getattr(model_args, "kt_max_cache_depth", None),
         kt_num_gpu_experts=getattr(model_args, "kt_num_gpu_experts", None),
         kt_weight_path=getattr(model_args, "kt_weight_path", None),
+        kt_expert_checkpoint_path=getattr(model_args, "kt_expert_checkpoint_path", None),
         kt_use_lora_experts=getattr(model_args, "kt_use_lora_experts", None),
         kt_lora_expert_num=getattr(model_args, "kt_lora_expert_num", None),
         kt_lora_expert_intermediate_size=getattr(model_args, "kt_lora_expert_intermediate_size", None),
@@ -2240,16 +3292,47 @@ def _replace_peft_weights_with_views(
         down_name: ("down_lora_a", "down_lora_b"),
     }
 
+    _replaced = 0
+    _first_logged = False
     for expert_idx in range(num_experts):
         expert_loras = peft_lora_modules.get(expert_idx, {})
         for proj_name, (key_a, key_b) in proj_to_keys.items():
             if proj_name not in expert_loras:
                 continue
             lora_A, lora_B = expert_loras[proj_name]
-            lora_A.weight = nn.Parameter(buffers[key_a][expert_idx], requires_grad=True)
-            lora_B.weight = nn.Parameter(buffers[key_b][expert_idx], requires_grad=True)
+
+            # Log before/after for first replacement to verify .data assignment
+            if not _first_logged:
+                _old_id_a = id(lora_A.weight)
+                _old_ptr_a = lora_A.weight.data_ptr()
+
+            # Use .data assignment to keep the same Parameter objects.
+            # This preserves optimizer references (which point to these objects).
+            # Creating new nn.Parameter() would break the optimizer link.
+            lora_A.weight.data = buffers[key_a][expert_idx]
+            lora_B.weight.data = buffers[key_b][expert_idx]
+            lora_A.weight.requires_grad_(True)
+            lora_B.weight.requires_grad_(True)
             lora_A.weight.grad = grad_buffers["grad_"+key_a][expert_idx]
             lora_B.weight.grad = grad_buffers["grad_"+key_b][expert_idx]
+
+            if not _first_logged:
+                _new_id_a = id(lora_A.weight)
+                _new_ptr_a = lora_A.weight.data_ptr()
+                _buf_ptr_a = buffers[key_a][expert_idx].data_ptr()
+                _has_grad = lora_A.weight.grad is not None
+                logger.info(
+                    "[_replace_peft_weights_with_views] first param: "
+                    "id %s->%s (same=%s) data_ptr %s->%s buf_ptr=%s (match=%s) "
+                    "has_grad=%s requires_grad=%s shape=%s",
+                    _old_id_a, _new_id_a, _old_id_a == _new_id_a,
+                    _old_ptr_a, _new_ptr_a, _buf_ptr_a, _new_ptr_a == _buf_ptr_a,
+                    _has_grad, lora_A.weight.requires_grad, tuple(lora_A.weight.shape),
+                )
+                _first_logged = True
+            _replaced += 1
+
+    logger.info("[_replace_peft_weights_with_views] replaced %d param pairs", _replaced)
 
 def update_kt_lora_pointers(model: nn.Module):
     """Mark KT wrapper LoRA pointers as dirty after optimizer.step()."""

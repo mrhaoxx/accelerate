@@ -1769,14 +1769,36 @@ class Accelerator:
         # The router (gate) and shared_experts remain FSDP2-managed so their
         # gradients are properly all-reduced across ranks.
         kt_plugin = getattr(self.state, "kt_config", None)
-        if kt_plugin is not None and kt_plugin.enabled and getattr(model, "_kt_wrappers", None) is not None:
+        kt_wrappers = None
+        if kt_plugin is not None and kt_plugin.enabled:
+            # _kt_wrappers lives on the base model, not on PEFT/FSDP wrappers.
+            # Unwrap through base_model / model attributes to find it.
+            kt_wrappers = getattr(model, "_kt_wrappers", None)
+            if kt_wrappers is None:
+                _base = model
+                for _attr in ("base_model", "model"):
+                    _base = getattr(_base, _attr, None)
+                    if _base is None:
+                        break
+                    kt_wrappers = getattr(_base, "_kt_wrappers", None)
+                    if kt_wrappers is not None:
+                        break
+        import sys as _sys
+        _rank = int(os.environ.get("LOCAL_RANK", 0))
+        _has_opt = any(isinstance(o, torch.optim.Optimizer) for o in result)
+        print(f"[KT DIAG _prepare_fsdp2 rank={_rank}] enter: model={type(model).__name__} has_optimizer={_has_opt} kt_wrappers={'found' if kt_wrappers is not None else 'NOT_FOUND'}", file=_sys.stderr, flush=True)
+
+        if kt_wrappers is not None:
             if self.state.fsdp_plugin.ignored_modules is None:
                 self.state.fsdp_plugin.ignored_modules = []
-            for wrapper in model._kt_wrappers:
+            _n_ignored_before = len(self.state.fsdp_plugin.ignored_modules)
+            for wrapper in kt_wrappers:
                 experts_attr = getattr(wrapper, '_experts_attr', 'experts')
                 experts = getattr(wrapper, experts_attr, None)
                 if experts is not None and experts not in self.state.fsdp_plugin.ignored_modules:
                     self.state.fsdp_plugin.ignored_modules.append(experts)
+            _n_ignored_after = len(self.state.fsdp_plugin.ignored_modules)
+            print(f"[KT DIAG _prepare_fsdp2 rank={_rank}] ignored_modules: {_n_ignored_before} -> {_n_ignored_after}", file=_sys.stderr, flush=True)
 
         # Needs to be done first, to make sure AC + fully_shard will work as expected
         self.state.fsdp_plugin.set_auto_wrap_policy(model)
@@ -1799,17 +1821,17 @@ class Accelerator:
         # Collect KT LoRA param data_ptrs to skip them during optimizer param swapping
         # These params are on CPU and managed by KT kernel, not FSDP2
         kt_lora_param_ptrs = set()
-        if hasattr(model, '_kt_moe_lora_params') and model._kt_moe_lora_params:
-            for layer_idx, lora_params in model._kt_moe_lora_params.items():
-                for param_name, param in lora_params.items():
-                    if isinstance(param, torch.nn.Parameter):
-                        kt_lora_param_ptrs.add(param.data_ptr())
+        if kt_wrappers is not None:
+            from .utils.kt_moe import get_kt_lora_params
+            for param in get_kt_lora_params(model):
+                kt_lora_param_ptrs.add(param.data_ptr())
 
         # Swap the optimizer parameters with empty, so `fully_shard` after will not allocate too much memory
         # BUT skip KT LoRA params - they should keep their original references
         from torch.distributed.tensor import DTensor
 
         kt_lora_params_saved = {}  # Save KT LoRA params to restore later
+        _n_kt_kept, _n_swapped = 0, 0
         for obj in result:
             if isinstance(obj, torch.optim.Optimizer):
                 for param_group in obj.param_groups:
@@ -1818,16 +1840,21 @@ class Accelerator:
                         if p_ptr in kt_lora_param_ptrs:
                             # Keep original KT LoRA param, save for later restoration
                             kt_lora_params_saved[p_ptr] = p
+                            _n_kt_kept += 1
                             continue
                         # We drop a reference to the original param here, so that _move_states_to_device triggers a reallocation
                         # We reassign the data_ptr to the original param, so that we preserve the mapping to the new ones
                         param_group["params"][i] = torch.empty(1, dtype=p.dtype, device=p.device)
                         param_group["params"][i].data_ptr = p_ptr
+                        _n_swapped += 1
+        print(f"[KT DIAG _prepare_fsdp2 rank={_rank}] optimizer param swap: {_n_swapped} swapped, {_n_kt_kept} KT kept", file=_sys.stderr, flush=True)
 
         self._models.append(model)
 
+        print(f"[KT DIAG _prepare_fsdp2 rank={_rank}] calling fsdp2_prepare_model...", file=_sys.stderr, flush=True)
         # Prepare everything FSDP2 related for the model (except AC)
         model = fsdp2_prepare_model(self, model)
+        print(f"[KT DIAG _prepare_fsdp2 rank={_rank}] fsdp2_prepare_model returned", file=_sys.stderr, flush=True)
 
         # Remove the old model from the list
         if len(self._models) > 1 and (self._models[-2] is self._models[-1]):
