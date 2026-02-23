@@ -1092,17 +1092,17 @@ class LoRAExpertMLP(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False, device=device, dtype=dtype)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False, device=device, dtype=dtype)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False, device=device, dtype=dtype)
+        self.le_gate = nn.Linear(hidden_size, intermediate_size, bias=False, device=device, dtype=dtype)
+        self.le_up = nn.Linear(hidden_size, intermediate_size, bias=False, device=device, dtype=dtype)
+        self.le_down = nn.Linear(intermediate_size, hidden_size, bias=False, device=device, dtype=dtype)
         self.act_fn = nn.SiLU()
 
-        nn.init.zeros_(self.down_proj.weight)
-        nn.init.kaiming_uniform_(self.gate_proj.weight, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.up_proj.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.le_down.weight)
+        nn.init.kaiming_uniform_(self.le_gate.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.le_up.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.le_down(self.act_fn(self.le_gate(x)) * self.le_up(x))
 
 
 class LoRAExperts(nn.Module):
@@ -1677,10 +1677,25 @@ class KTMoEFunction(torch.autograd.Function):
         ctx.num_experts_per_tok = num_experts_per_tok
         ctx.layer_idx = layer_idx
 
+        # Save a sentinel tensor so non-reentrant checkpoint's saved_tensors
+        # hooks can intercept it.  When backward accesses ctx.saved_tensors,
+        # the checkpoint unpack hook triggers a full recompute of the decoder
+        # layer — which re-runs the MoE forward with save_for_backward=True,
+        # populating the C++ cache BEFORE this backward proceeds.
+        # Without this, MoE backward runs before the recompute (MoE comes
+        # after attention in forward order → its backward runs first), and
+        # the C++ cache is empty when first-forward cache-skip is active.
+        ctx.save_for_backward(hidden_states.new_empty(()))
+
         return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        # Access saved_tensors FIRST — under non-reentrant checkpoint this
+        # triggers the unpack hook which runs a full decoder-layer recompute,
+        # populating the C++ cache before we call wrapper.backward().
+        _ = ctx.saved_tensors
+
         qlen = ctx.qlen
         hidden_size = ctx.hidden_size
         batch_size = ctx.batch_size
@@ -1953,7 +1968,7 @@ class KTMoELayerWrapper(nn.Module):
         moe_config: MOEArchConfig,
         hidden_size: int,
         layer_idx: int,
-        lora_experts: "LoRAExperts | None" = None,  # Deprecated, ignored
+        lora_experts: "LoRAExperts | None" = None,
     ):
         super().__init__()
         self._is_kt_moe_wrapper = True
@@ -2107,6 +2122,11 @@ class KTMoELayerWrapper(nn.Module):
         # checkpoint first-forward prevents KTMoEFunction.backward from running.
         use_autograd_path = save_for_backward
         save_for_backward_submit = use_autograd_path
+        # Only suppress cache when we have high-confidence first_forward detection
+        # via the saved_tensors_hooks stack. The stack-walk fallback is too fragile
+        # for a correctness-critical decision — it only logs.
+        if ckpt_hook_mode == "first_forward":
+            save_for_backward_submit = False
         if KT_MEM_LOG:
             graph_task_id = -1
             try:
@@ -2722,6 +2742,21 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
     lora_rank = getattr(kt_plugin, "lora_rank", 1) or 1
     lora_alpha = getattr(kt_plugin, "lora_alpha", 1.0) or 1.0
 
+    # Read LoRA Experts configuration
+    _raw_le = getattr(kt_plugin, "kt_use_lora_experts", None)
+    use_lora_experts = bool(_raw_le) if _raw_le is not None else False
+    lora_expert_num = getattr(kt_plugin, "kt_lora_expert_num", 2) or 2
+    lora_expert_intermediate_size = getattr(kt_plugin, "kt_lora_expert_intermediate_size", 1024) or 1024
+
+    if is_rank_0:
+        print(
+            f"[kt_moe LoRA Experts] kt_plugin type={type(kt_plugin).__name__}, "
+            f"raw kt_use_lora_experts={_raw_le!r} (type={type(_raw_le).__name__}), "
+            f"use_lora_experts={use_lora_experts}, "
+            f"num={lora_expert_num}, intermediate_size={lora_expert_intermediate_size}",
+            flush=True,
+        )
+
     wrappers: list[KTMoELayerWrapper] = []
     moe_layer_count = 0
 
@@ -2934,6 +2969,17 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                 flush=True,
             )
 
+        # Create LoRA Experts if enabled
+        lora_experts = None
+        if use_lora_experts:
+            lora_experts = LoRAExperts(
+                num_experts=lora_expert_num,
+                hidden_size=hidden_size,
+                intermediate_size=lora_expert_intermediate_size,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+
         layer_wrapper = KTMoELayerWrapper(
             original_moe=moe_module,
             wrapper=wrapper,
@@ -2941,6 +2987,7 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
             moe_config=moe_config,
             hidden_size=hidden_size,
             layer_idx=layer_idx,
+            lora_experts=lora_experts,
         )
         layer_wrapper._skip_lora = "SkipLoRA" in kt_method
 
@@ -3504,6 +3551,14 @@ def save_lora_experts_to_adapter(model: nn.Module, output_dir: str) -> None:
 
     wrappers = getattr(model, "_kt_wrappers", [])
     if not wrappers:
+        base_model = model
+        for attr in ["base_model", "model"]:
+            if hasattr(base_model, attr):
+                base_model = getattr(base_model, attr)
+                wrappers = getattr(base_model, "_kt_wrappers", [])
+                if wrappers:
+                    break
+    if not wrappers:
         logger.warning("No KT wrappers found, skipping LoRA Experts saving")
         return
 
@@ -3529,9 +3584,9 @@ def save_lora_experts_to_adapter(model: nn.Module, output_dir: str) -> None:
         layer_idx = wrapper.layer_idx
         for expert_idx, expert in enumerate(wrapper.lora_experts.experts):
             base_key = f"base_model.model.model.layers.{layer_idx}.mlp.lora_experts.{expert_idx}"
-            state_dict[f"{base_key}.gate_proj.weight"] = expert.gate_proj.weight.data.cpu().clone()
-            state_dict[f"{base_key}.up_proj.weight"] = expert.up_proj.weight.data.cpu().clone()
-            state_dict[f"{base_key}.down_proj.weight"] = expert.down_proj.weight.data.cpu().clone()
+            state_dict[f"{base_key}.le_gate.weight"] = expert.le_gate.weight.data.cpu().clone()
+            state_dict[f"{base_key}.le_up.weight"] = expert.le_up.weight.data.cpu().clone()
+            state_dict[f"{base_key}.le_down.weight"] = expert.le_down.weight.data.cpu().clone()
             lora_expert_count += 3
 
         logger.debug(f"Added LoRA Experts for layer {layer_idx} ({len(wrapper.lora_experts.experts)} experts)")
@@ -3552,17 +3607,31 @@ def save_kt_moe_to_adapter(model: nn.Module, output_dir: str) -> None:
     Note: Per-expert PEFT LoRA is saved by PEFT directly, not here.
     This function only handles lora_experts (a separate feature).
     """
+    print(f"[save_kt_moe] called, model type={type(model).__name__}, output_dir={output_dir}", flush=True)
     wrappers = getattr(model, "_kt_wrappers", [])
+    print(f"[save_kt_moe] direct _kt_wrappers: {len(wrappers) if wrappers else 'None/empty'}", flush=True)
     if not wrappers:
-        logger.warning("No KT wrappers found, skipping KT MoE saving")
+        base_model = model
+        for attr in ["base_model", "model"]:
+            if hasattr(base_model, attr):
+                base_model = getattr(base_model, attr)
+                print(f"[save_kt_moe] trying {attr} -> {type(base_model).__name__}", flush=True)
+                wrappers = getattr(base_model, "_kt_wrappers", [])
+                if wrappers:
+                    print(f"[save_kt_moe] found {len(wrappers)} wrappers on {attr}", flush=True)
+                    break
+    if not wrappers:
+        print("[save_kt_moe] No KT wrappers found anywhere, skipping", flush=True)
         return
 
     has_lora_experts = any(w.lora_experts is not None for w in wrappers)
+    le_info = [(i, w.layer_idx, w.lora_experts is not None) for i, w in enumerate(wrappers)]
+    print(f"[save_kt_moe] has_lora_experts={has_lora_experts}, wrappers={le_info[:5]}...", flush=True)
 
     if has_lora_experts:
         save_lora_experts_to_adapter(model, output_dir)
     else:
-        logger.info("No lora_experts in KT wrappers (PEFT LoRA is saved by PEFT directly)")
+        print("[save_kt_moe] No lora_experts in KT wrappers", flush=True)
 
 
 def load_lora_experts_from_adapter(model: nn.Module, adapter_path: str) -> None:
@@ -3591,17 +3660,20 @@ def load_lora_experts_from_adapter(model: nn.Module, adapter_path: str) -> None:
         logger.warning("No LoRA Experts found in KT wrappers, skipping")
         return
 
-    adapter_file = os.path.join(adapter_path, "adapter_model.safetensors")
+    # Prefer dedicated lora_experts file, fallback to adapter file
+    adapter_file = os.path.join(adapter_path, "lora_experts.safetensors")
     if not os.path.exists(adapter_file):
-        adapter_file = os.path.join(adapter_path, "adapter_model.bin")
+        adapter_file = os.path.join(adapter_path, "adapter_model.safetensors")
         if not os.path.exists(adapter_file):
-            logger.warning(f"No adapter file found at {adapter_path}")
-            return
+            adapter_file = os.path.join(adapter_path, "adapter_model.bin")
+            if not os.path.exists(adapter_file):
+                logger.warning(f"No lora_experts or adapter file found at {adapter_path}")
+                return
 
     logger.info(f"Loading LoRA Experts from {adapter_file}")
 
     lora_expert_pattern = re.compile(
-        r"base_model\.model\.model\.layers\.(\d+)\.mlp\.lora_experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
+        r"base_model\.model\.model\.layers\.(\d+)\.mlp\.lora_experts\.(\d+)\.(le_gate|le_up|le_down)\.weight"
     )
 
     layer_weights = {}
@@ -3625,12 +3697,12 @@ def load_lora_experts_from_adapter(model: nn.Module, adapter_path: str) -> None:
             if expert_idx >= len(wrapper.lora_experts.experts):
                 continue
             expert = wrapper.lora_experts.experts[expert_idx]
-            if "gate_proj" in proj_dict:
-                expert.gate_proj.weight.data.copy_(proj_dict["gate_proj"].to(expert.gate_proj.weight.device))
-            if "up_proj" in proj_dict:
-                expert.up_proj.weight.data.copy_(proj_dict["up_proj"].to(expert.up_proj.weight.device))
-            if "down_proj" in proj_dict:
-                expert.down_proj.weight.data.copy_(proj_dict["down_proj"].to(expert.down_proj.weight.device))
+            if "le_gate" in proj_dict:
+                expert.le_gate.weight.data.copy_(proj_dict["le_gate"].to(expert.le_gate.weight.device))
+            if "le_up" in proj_dict:
+                expert.le_up.weight.data.copy_(proj_dict["le_up"].to(expert.le_up.weight.device))
+            if "le_down" in proj_dict:
+                expert.le_down.weight.data.copy_(proj_dict["le_down"].to(expert.le_down.weight.device))
             loaded_count += 1
 
     logger.info(f"Loaded LoRA Experts for {loaded_count} experts from {adapter_path}")
