@@ -1691,6 +1691,10 @@ class KTMoEFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        # Wait for any in-flight async repack before recompute forward uses the pool
+        if getattr(ctx.wrapper, 'share_backward_bb', False):
+            ctx.wrapper.wait_backward_repack()
+
         # Access saved_tensors FIRST — under non-reentrant checkpoint this
         # triggers the unpack hook which runs a full decoder-layer recompute,
         # populating the C++ cache before we call wrapper.backward().
@@ -1948,6 +1952,11 @@ class KTMoEFunction(torch.autograd.Function):
                     tag=f"after_backward_{backward_count}",
                     topk=12,
                 )
+
+        # Trigger async repack for next MoE layer in backward order
+        next_bwd = getattr(ctx.wrapper, '_next_backward_wrapper', None)
+        if next_bwd is not None and getattr(next_bwd, 'share_backward_bb', False):
+            next_bwd.submit_backward_repack()
 
         return grad_input, None, grad_weights, None, None, None, None, None, None, None, None
 
@@ -2934,6 +2943,12 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
                 max_cache_depth=getattr(kt_plugin, "kt_max_cache_depth", 2),
             )
 
+            # Set share_backward_bb BEFORE load_weights (config is built during load)
+            share_backward_bb = getattr(kt_plugin, "kt_share_backward_bb", None)
+            if share_backward_bb is None:
+                share_backward_bb = os.environ.get("ACCELERATE_KT_SHARE_BACKWARD_BB", "").lower() in ("true", "1", "yes")
+            wrapper.share_backward_bb = share_backward_bb
+
             physical_to_logical_map = torch.arange(moe_config.expert_num, dtype=torch.int64, device="cpu")
 
             if use_kt_weight_path:
@@ -3005,6 +3020,14 @@ def wrap_moe_layers_with_kt_wrapper(model: nn.Module, kt_plugin: Any) -> list[KT
         _clear_original_expert_weights(moe_module, moe_config)
 
     logger.info(f"Wrapped {moe_layer_count} MoE layers with KTMoEWrapper")
+
+    # Link wrappers for async backward repack (higher layer triggers repack for lower)
+    for i in range(1, len(wrappers)):
+        if wrappers[i].wrapper is not None and wrappers[i - 1].wrapper is not None:
+            wrappers[i].wrapper._next_backward_wrapper = wrappers[i - 1].wrapper
+    if wrappers and wrappers[0].wrapper is not None:
+        wrappers[0].wrapper._next_backward_wrapper = None
+
     gc.collect()
     return wrappers
 

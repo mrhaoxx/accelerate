@@ -2836,6 +2836,7 @@ class KTransformersPlugin:
     lora_alpha: float | None = None
     model_max_length: int | None = None
     kt_skip_expert_loading: bool | None = None
+    kt_share_backward_bb: bool | None = None
     kt_checkpoint_files: list[str] | None = None
     kt_sharded_metadata: dict | None = None
     bypass_device_map_check: bool | None = None
@@ -2918,6 +2919,9 @@ class KTransformersPlugin:
                 )
             else:
                 self.kt_skip_expert_loading = True
+
+        if self.kt_share_backward_bb is None:
+            self.kt_share_backward_bb = parse_flag_from_env("ACCELERATE_KT_SHARE_BACKWARD_BB", default=False)
 
         if self.bypass_device_map_check is None:
             self.bypass_device_map_check = parse_flag_from_env(

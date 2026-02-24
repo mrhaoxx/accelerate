@@ -128,6 +128,7 @@ def _apply_kt_config_to_env(args: argparse.Namespace, current_env: dict[str, str
         "lora_alpha": "ACCELERATE_KT_LORA_ALPHA",
         "model_max_length": "ACCELERATE_KT_MODEL_MAX_LENGTH",
         "kt_skip_expert_loading": "ACCELERATE_KT_SKIP_EXPERT_LOADING",
+        "kt_share_backward_bb": "ACCELERATE_KT_SHARE_BACKWARD_BB",
         "bypass_device_map_check": "ACCELERATE_KT_BYPASS_DEVICE_MAP",
         "skip_device_placement": "ACCELERATE_KT_SKIP_DEVICE_PLACEMENT",
     }
