@@ -3149,7 +3149,14 @@ def load_kt_model(
     expert_device = get_expert_device(model, moe_config)
     logger.info(f"MoE experts on device: {expert_device}")
 
-    wrappers = wrap_moe_layers_with_kt_wrapper(model, kt_plugin)
+    # Check if from_pretrained already wrapped MoE layers (via kt.py integration inside transformers).
+    # If so, skip wrapping again to avoid loading expert weights twice.
+    existing_wrappers = getattr(model, "_kt_wrappers", None)
+    if existing_wrappers:
+        logger.info(f"MoE layers already wrapped by from_pretrained ({len(existing_wrappers)} layers), skipping re-wrap")
+        wrappers = existing_wrappers
+    else:
+        wrappers = wrap_moe_layers_with_kt_wrapper(model, kt_plugin)
 
     model._kt_wrappers = wrappers
     model._kt_tp_enabled = bool(getattr(kt_plugin, "kt_tp_enabled", False))
